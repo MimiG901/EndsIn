@@ -209,8 +209,25 @@ STAKE_MULT_MIN    = 1.00   # never below Deriv's own stake floor
 STAKE_MULT_MAX    = 1.75   # cap on edge-driven upsizing (separate from and
                             # multiplicative with martingale recovery scaling)
 
+# Explicit hard-dollar ceiling on any SINGLE trade's stake, independent of
+# and enforced AFTER all the martingale/edge-scaling math above. A
+# deliberate second, dumb, unconditional backstop: account-size risk
+# hygiene that holds even if a future change to any of the constants above
+# (or a bug in how they combine) would otherwise let a single stake climb
+# further than intended. Override via env var if your account size can
+# support more.
+ABS_MAX_STAKE = float(os.getenv("ABS_MAX_STAKE", "2.00"))
+
+# v15 (2026-07-31): stake growth of ANY kind (martingale escalation, edge-
+# scaled upsizing) is disabled below this account balance -- trades flat
+# at BASE_STAKE until the account has built a cushion. See next_stake()'s
+# docstring for the real-log evidence motivating this (constant escalation
+# to the stake cap after 6 consecutive losses, ~31% realized win rate, on
+# what was likely still a small account).
+STAKE_GROWTH_UNLOCK_BALANCE = float(os.getenv("STAKE_GROWTH_UNLOCK_BALANCE", "15.00"))
+
 # ── Signal confirmation (reduces trade frequency / false positives) ───────
-CONFIRM_REQUIRED      = 1      # consecutive passes the top candidate must survive
+CONFIRM_REQUIRED      = 0      # consecutive passes the top candidate must survive
 CONFIRM_MIN_GAP_SECS  = 60     # minimum time between confirmation checks
 CONFIRM_MAX_AGE_SECS  = 600    # abandon a confirmation streak if it's been open
                                 # this long without completing (stale signal)
@@ -243,7 +260,10 @@ MC_BATCH_SIZE    = 75_000
 # v3: widened to 30s steps end-to-end (was a hand-picked 7-value list) so the
 # optimizer samples far more of the duration space per cycle -- this is the
 # "widen the opportunity set" fix, independent of the edge-bar changes above.
-DURATION_CANDIDATES = list(range(60, 481, 30))   # 60,90,...,480 (15 values)
+DURATION_CANDIDATES = list(range(120, 481, 30))   # v15: was 60,90,...,480;
+                                                     # floor raised to 120s
+                                                     # per explicit request --
+                                                     # 120,150,...,480 (13 values)
 # Barrier expressed as multiples of terminal vol. v3: finer step (0.05 instead
 # of the old hand-picked list) across the same overall range, plus extending
 # down to 0.30 now that the win_prob ceiling isn't artificially truncating
@@ -281,9 +301,18 @@ BARRIER_ABS_MIN = 0.3    # minimum absolute barrier (price units)
 # Bias signal: measured over this many ticks of recent price history
 BIAS_LOOKBACK      = 60      # ticks to measure directional drift
 BIAS_MAX           = 0.35    # cap bias magnitude (prevents degenerate barriers)
-# Grid of asymmetry ratios for (upper, lower) sides swept around symmetric base.
-# Ratio > 1.0 = that side is wider than the symmetric baseline.
-ASYM_RATIO_GRID    = [0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30]
+# v15 (2026-07-31): symmetric-only trades, per explicit request -- asymmetric
+# barriers add a second dimension of variance to what the LSTM classifier
+# and MC engine both need to learn/estimate well, on top of duration and
+# barrier width. Collapsing ASYM_RATIO_GRID to a single (1.0, 1.0) pair
+# means asym_pairs below always has exactly one entry -- every candidate is
+# a symmetric barrier, and the whole asymmetric sweep/scoring machinery
+# just runs once per duration instead of over a 7x7 grid (also a nice
+# side-effect: ~49x fewer candidates to evaluate per duration, meaning more
+# compute budget per cycle for what's left). If you want asymmetric
+# barriers back later, restore the original 7-value grid here -- nothing
+# else needs to change.
+ASYM_RATIO_GRID    = [1.00]
 # Neither side can be less than this fraction of the symmetric barrier_abs
 ASYM_SIDE_MIN_FRAC = 0.60
 
@@ -889,15 +918,29 @@ class BotState:
         Escalates only after MG_TRIGGER_LOSSES consecutive losses, capped at
         MG_MAX_STEPS, multiplied by MG_FACTOR per step. Resets to BASE_STAKE
         the instant a win occurs (see record_trade_result).
+
+        v15 (2026-07-31): stake growth of ANY kind (martingale escalation
+        here, and edge-scaled upsizing in edge_scaled_stake() below) is
+        gated behind STAKE_GROWTH_UNLOCK_BALANCE -- per explicit request,
+        the account trades flat at BASE_STAKE until it's built up enough of
+        a cushion to absorb a losing streak without the stake climbing on
+        top of a still-small balance. Real log evidence motivating this:
+        a 31% realized win rate with stakes constantly escalating to the
+        $1.12 cap after 6 consecutive losses, on what was likely still a
+        small account -- profitable so far, but a rough combination for a
+        long losing streak. Once balance clears the threshold, behaves
+        exactly as before.
         """
         if not MG_ENABLED:
+            return BASE_STAKE
+        if self.balance < STAKE_GROWTH_UNLOCK_BALANCE:
             return BASE_STAKE
         cl = self.consec_losses.get(symbol, 0)
         if cl < MG_TRIGGER_LOSSES:
             return BASE_STAKE
         step  = min(self.mg_step.get(symbol, 0) + 1, MG_MAX_STEPS)
         stake = BASE_STAKE * (MG_FACTOR ** step)
-        return round(min(stake, MG_MAX_STAKE), 2)
+        return round(min(stake, MG_MAX_STAKE, ABS_MAX_STAKE), 2)
 
     def edge_scaled_stake(self, symbol: str, edge_frac: float) -> float:
         """
@@ -906,7 +949,14 @@ class BotState:
         have been excluded by the caller (this function does not re-check
         that floor). Linear interpolation from STAKE_MULT_MIN at
         MIN_EDGE_FRAC to STAKE_MULT_MAX at TARGET_EDGE_FRAC, clamped beyond.
+
+        v15: short-circuits to flat BASE_STAKE below STAKE_GROWTH_UNLOCK_
+        BALANCE -- same gate as next_stake(), enforced here too so edge-
+        based upsizing can't grow the stake independently of the martingale
+        gate above.
         """
+        if self.balance < STAKE_GROWTH_UNLOCK_BALANCE:
+            return BASE_STAKE
         base = self.next_stake(symbol)
         if TARGET_EDGE_FRAC <= MIN_EDGE_FRAC:
             mult = STAKE_MULT_MIN
@@ -914,7 +964,7 @@ class BotState:
             t = (edge_frac - MIN_EDGE_FRAC) / (TARGET_EDGE_FRAC - MIN_EDGE_FRAC)
             mult = STAKE_MULT_MIN + t * (STAKE_MULT_MAX - STAKE_MULT_MIN)
             mult = float(np.clip(mult, STAKE_MULT_MIN, STAKE_MULT_MAX))
-        return round(min(base * mult, MG_MAX_STAKE * STAKE_MULT_MAX), 2)
+        return round(min(base * mult, MG_MAX_STAKE * STAKE_MULT_MAX, ABS_MAX_STAKE), 2)
 
     def record_trade_result(self, symbol: str, won: bool):
         """Updates consecutive-loss streak and martingale step for a symbol."""
@@ -2110,7 +2160,7 @@ async def execute_expiryrange(client: DerivClient, state: BotState,
     bias_tag = (f"UP {bias_val:+.3f}" if bias_val >  0.02 else
                 f"DN {bias_val:+.3f}" if bias_val < -0.02 else
                 f"FLAT {bias_val:+.3f}")
-    mg_tag = (f"MARTINGALE step={state.mg_step.get(symbol,0)+1}/{MG_MAX_STEPS} "
+    mg_tag = (f"MARTINGALE step={min(state.mg_step.get(symbol,0)+1, MG_MAX_STEPS)}/{MG_MAX_STEPS} "
               f"(after {state.consec_losses.get(symbol,0)} consec losses)"
               if mg_active else "base stake")
     edge_tag = (f" + edge-scaled x{stake/base_stake:.2f} (edge_frac={edge_frac:+.3f})"
