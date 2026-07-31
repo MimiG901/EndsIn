@@ -210,7 +210,7 @@ STAKE_MULT_MAX    = 1.75   # cap on edge-driven upsizing (separate from and
                             # multiplicative with martingale recovery scaling)
 
 # ── Signal confirmation (reduces trade frequency / false positives) ───────
-CONFIRM_REQUIRED      = 0      # consecutive passes the top candidate must survive
+CONFIRM_REQUIRED      = 1      # consecutive passes the top candidate must survive
 CONFIRM_MIN_GAP_SECS  = 60     # minimum time between confirmation checks
 CONFIRM_MAX_AGE_SECS  = 600    # abandon a confirmation streak if it's been open
                                 # this long without completing (stale signal)
