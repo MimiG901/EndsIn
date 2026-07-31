@@ -43,12 +43,15 @@ Env vars required (same as the live bot):
 """
 import asyncio
 import base64
+import gc
 import io
 import json
 import math
 import os
+import resource
 import sys
 import time
+import traceback
 from typing import Optional
 
 import numpy as np
@@ -75,7 +78,20 @@ MAX_TICKS           = int(os.getenv("LSTM_MAX_TICKS", "300000"))   # hard cap,
                                                                      # runtime/memory
 TICKS_PER_HISTORY_CALL = 5000   # Deriv's ticks_history cap
 EPOCHS              = int(os.getenv("LSTM_EPOCHS", "15"))
-BATCH_SIZE          = int(os.getenv("LSTM_BATCH_SIZE", "256"))
+BATCH_SIZE          = int(os.getenv("LSTM_BATCH_SIZE", "64"))   # v14: was 256 --
+                                                                   # smaller batches
+                                                                   # mean smaller
+                                                                   # per-step
+                                                                   # activation/
+                                                                   # gradient memory,
+                                                                   # worth trading a
+                                                                   # bit of training
+                                                                   # speed for on a
+                                                                   # free-tier
+                                                                   # container. Bump
+                                                                   # back up via env
+                                                                   # var if you move
+                                                                   # to a paid plan.
 LEARNING_RATE       = float(os.getenv("LSTM_LR", "1e-3"))
 VAL_FRACTION        = 0.15   # held-out tail (chronological, not shuffled --
                               # shuffling would leak future info into val)
@@ -103,6 +119,16 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 API_BASE   = "https://api.derivws.com/trading/v1/options"
 ACCOUNTS_PATH = "/accounts"
 OTP_PATH      = "/accounts/{account_id}/otp"
+
+
+def log_peak_mem(tag: str):
+    """Prints peak RSS so far. Cheap (stdlib only, no psutil dependency) and
+    lets us see in the logs exactly how close to the container's memory
+    ceiling we got, and at which stage -- if the process gets OOM-killed,
+    the last of these lines printed tells us where it died, since a kill
+    from outside the process leaves no traceback of its own."""
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"[Trainer] [mem] {tag}: peak RSS so far = {peak_mb:.0f} MB")
 
 
 # =============================================================================
@@ -226,29 +252,8 @@ async def fetch_full_history(client: MinimalDerivClient, symbol: str,
 
 
 # =============================================================================
-# DATASET CONSTRUCTION (v9, memory-fixed v13)
+# DATASET CONSTRUCTION (v9)
 # =============================================================================
-# v13 MEMORY FIX (2026-07-31): the previous version called windows.append
-# (window) per example -- a full WINDOW_SIZE-length COPY of the return
-# window, once per (anchor, duration, barrier_sigma) combo, even though the
-# window is IDENTICAL for every combo sharing the same anchor. With
-# COMBOS_PER_ANCHOR=4, that's 4x more window copies than distinct windows
-# actually exist. Then `np.array(windows)` materializes ALL of them into one
-# dense (n_examples, window_size) array -- at n_examples~240k this is
-# ~365MB in float64, and converting that to a torch tensor for training
-# makes a SECOND full copy alongside the first before the old one is
-# garbage collected. That's the actual mechanism behind the "peak RSS ~676MB
-# right before the first epoch" pattern -- consistent with an OOM kill on a
-# memory-capped Railway plan.
-#
-# Fix: never materialize the window itself during dataset construction.
-# Store only the lightweight anchor index (a single int) per example --
-# BarrierExampleDataset (below) slices the actual window LAZILY, per
-# __getitem__, directly from the shared `returns` array (a few hundred KB
-# total, not duplicated). Peak memory drops from O(n_examples * window_size)
-# to O(n_examples) -- for 240k examples that's roughly 640KB (three float32
-# values per example: anchor index, duration_norm, barrier_sigma, label)
-# instead of ~365MB+.
 def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
                            window_size: int = WINDOW_SIZE,
                            rng: Optional[np.random.Generator] = None):
@@ -259,7 +264,7 @@ def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
     heavily otherwise, adding little information for a lot more compute):
 
       1. recent window = returns[t-window_size : t]  (what the model sees --
-         NOT stored here, see v13 note above; only `t` itself is kept)
+         NOT stored here, see v14 note below; only `t` itself is kept)
       2. local realized vol = std(recent window) -- a fast, anchor-local
          stand-in for a full GARCH refit at every single historical point
          (which would be far too slow at this scale). This is the SAME
@@ -275,11 +280,24 @@ def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
          the same symmetric win condition win_prob_from_samples() checks
          in the live bot, computed retroactively against real history.
 
+    v14 MEMORY FIX (2026-07-31, Railway free tier): the previous version
+    (thank you for the preallocated-array optimization -- that WAS a real
+    improvement over the original list-append version, cutting out the
+    double list+array copy) still allocated one dense (max_n, window_size)
+    float32 array up front -- at n~240k examples that's still ~190MB, and
+    train_model() then made a SECOND ~190MB copy converting it to a torch
+    tensor. On a free-tier container that's likely the difference between
+    fitting and not. This version stores ONLY the anchor index (a single
+    int) per example -- BarrierExampleDataset (below) slices the actual
+    window LAZILY per __getitem__, straight from the shared `returns`
+    array (a few hundred KB total, never duplicated per-example). Peak
+    memory for the whole labeled dataset drops from ~190MB to under 5MB
+    at this scale.
+
     No trade history needed -- every label comes from price history alone.
     Returns (anchors, duration_sigma pairs, labels) as plain numpy arrays,
     still in CHRONOLOGICAL anchor order (caller does the train/val split).
-    `anchors` are int64 indices into `returns`, NOT the windows themselves --
-    pair with BarrierExampleDataset to get actual windows at train time.
+    `anchors` are int64 indices into `returns`, NOT the windows themselves.
     """
     rng = rng or np.random.default_rng()
     n = len(returns)
@@ -287,13 +305,38 @@ def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
     lo_dur, hi_dur = DURATION_TICKS_RANGE
     lo_sig, hi_sig = BARRIER_SIGMA_RANGE
 
-    anchors, ds_pairs, labels = [], [], []
     anchor_start = window_size
     anchor_end = n - max_dur - 1   # need max_dur future returns available
     if anchor_end <= anchor_start:
-        return (np.empty((0,), dtype=np.int64), np.empty((0, 2)), np.empty((0,)))
+        return (np.empty((0,), dtype=np.int64),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
 
-    for t in range(anchor_start, anchor_end, ANCHOR_STRIDE):
+    anchor_ts = range(anchor_start, anchor_end, ANCHOR_STRIDE)
+    n_anchors = len(anchor_ts)
+    max_n = n_anchors * COMBOS_PER_ANCHOR   # worst case, some anchors/combos get skipped
+
+    # Preallocated, but now just 3 tiny columns (anchor idx, 2 ds values,
+    # label) instead of a (max_n, window_size) array -- max_n*4*4 bytes
+    # total (~3.8MB at 240k examples) instead of max_n*window_size*4
+    # (~190MB). Still avoids the list+array double-copy pattern the v9
+    # version had.
+    anchors = np.empty((max_n,), dtype=np.int64)
+    ds_pairs = np.empty((max_n, 2), dtype=np.float32)
+    labels = np.empty((max_n,), dtype=np.float32)
+
+    print(f"[Trainer] Building labeled examples: {n_anchors} anchors x "
+          f"{COMBOS_PER_ANCHOR} combos (up to {max_n} examples)...")
+    log_peak_mem("before building labeled examples")
+
+    idx = 0
+    progress_every = max(1, n_anchors // 5)   # ~5 progress lines total
+    for i, t in enumerate(anchor_ts):
+        if i > 0 and i % progress_every == 0:
+            print(f"[Trainer]   ...{i}/{n_anchors} anchors processed "
+                  f"({idx} examples so far)")
+            log_peak_mem(f"anchor {i}/{n_anchors}")
+
         window = returns[t - window_size:t]   # cheap numpy VIEW, not copied
         local_vol_per_tick = float(np.std(window)) * float(prices[t])
         if local_vol_per_tick <= 0:
@@ -314,15 +357,23 @@ def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
             displacement = terminal_price - entry_price
             label = 1.0 if (-barrier_abs < displacement < barrier_abs) else 0.0
 
-            anchors.append(t)   # NOT the window -- see v13 note above
-            ds_pairs.append((normalize_duration(n_steps), barrier_sigma))
-            labels.append(label)
+            anchors[idx] = t   # NOT the window -- see v14 note above
+            ds_pairs[idx, 0] = normalize_duration(n_steps)
+            ds_pairs[idx, 1] = barrier_sigma
+            labels[idx] = label
+            idx += 1
 
-    if not anchors:
-        return (np.empty((0,), dtype=np.int64), np.empty((0, 2)), np.empty((0,)))
-    return (np.array(anchors, dtype=np.int64),
-            np.array(ds_pairs, dtype=np.float32),
-            np.array(labels, dtype=np.float32))
+    print(f"[Trainer] Built {idx} labeled examples.")
+    log_peak_mem("after building labeled examples")
+
+    if idx == 0:
+        return (np.empty((0,), dtype=np.int64),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+    # Trim the unused tail (skipped anchors/combos left preallocated rows
+    # unwritten) -- this is a view/copy of just the used rows, not a
+    # second full-size allocation.
+    return anchors[:idx], ds_pairs[:idx], labels[:idx]
 
 
 class BarrierExampleDataset(torch.utils.data.Dataset):
@@ -333,7 +384,7 @@ class BarrierExampleDataset(torch.utils.data.Dataset):
     array (a few hundred KB for a multi-day tick history) shared by
     reference across every example, never copied per-example. This is what
     keeps this dataset's memory footprint at O(n_examples) instead of
-    O(n_examples * window_size) -- see the v13 comment above
+    O(n_examples * window_size) -- see the v14 comment above
     build_labeled_examples() for the full rationale.
     """
     def __init__(self, returns: np.ndarray, anchors: np.ndarray,
@@ -355,6 +406,7 @@ class BarrierExampleDataset(torch.utils.data.Dataset):
         ds = torch.tensor(self.ds_pairs[idx], dtype=torch.float32)
         y = torch.tensor(self.labels[idx], dtype=torch.float32)
         return x, ds, y
+
 
 
 # =============================================================================
@@ -411,9 +463,14 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
     anchors_train, DS_train, y_train = anchors[:-n_val], DS[:-n_val], y[:-n_val]
     anchors_val, DS_val, y_val       = anchors[-n_val:], DS[-n_val:], y[-n_val:]
 
-    # v13: lazy datasets -- windows are sliced from `returns` on the fly per
-    # __getitem__, never materialized as one giant array. See
-    # BarrierExampleDataset's docstring for why this is the actual OOM fix.
+    # v14: lazy datasets -- windows are sliced from `returns` on the fly per
+    # __getitem__, never materialized as one giant array (see
+    # BarrierExampleDataset's docstring). This replaces what used to be the
+    # single biggest remaining memory spike in this function (converting
+    # the full X array to a torch tensor, a second ~190MB copy on top of
+    # the ~190MB numpy array already built in build_labeled_examples()).
+    gc.collect()
+    log_peak_mem("before building datasets/loaders")
     train_ds = BarrierExampleDataset(returns, anchors_train, DS_train, y_train, WINDOW_SIZE)
     val_ds   = BarrierExampleDataset(returns, anchors_val, DS_val, y_val, WINDOW_SIZE)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
@@ -421,6 +478,12 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
     # whole val tensor before) -- keeps peak memory bounded regardless of
     # how large VAL_FRACTION * n_examples gets.
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Free-tier safety: torch defaults to using all visible CPU cores, each
+    # with its own intermediate buffers -- on a shared/limited container
+    # this buys parallelism you don't have room for. One thread is plenty
+    # for a model this small.
+    torch.set_num_threads(1)
 
     model = BarrierWinClassifier(window_size=WINDOW_SIZE, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -430,6 +493,7 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
     best_val_acc = 0.0
     best_state = None
 
+    log_peak_mem("before first epoch")
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_losses = []
@@ -456,6 +520,8 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
         train_loss = float(np.mean(train_losses))
         print(f"[Trainer] epoch {epoch}/{EPOCHS}  train_bce={train_loss:.5f}  "
               f"val_bce={val_loss:.5f}  val_acc={val_acc:.3f}")
+        if epoch == 1:
+            log_peak_mem("after first epoch")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -484,8 +550,15 @@ async def main():
         print(f"[Trainer] Only {len(prices)} ticks fetched -- aborting, "
               f"not enough data to train on.")
         sys.exit(1)
+    log_peak_mem("after fetching tick history")
 
-    returns = np.diff(prices) / prices[:-1]
+    # float32 instead of numpy's default float64 -- halves the (already
+    # small, a few MB at most) footprint of these two arrays. Not the main
+    # fix here (build_labeled_examples()/BarrierExampleDataset are), but
+    # free on a container where every MB matters.
+    prices = prices.astype(np.float32)
+    returns = (np.diff(prices) / prices[:-1]).astype(np.float32)
+    gc.collect()
     print(f"[Trainer] Fetched {len(prices)} ticks -> {len(returns)} returns "
           f"spanning ~{len(prices)/86400:.2f} days")
 
@@ -506,4 +579,16 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        # asyncio.run() would print this to stderr anyway on an unhandled
+        # exception, but making it explicit here means it's guaranteed to
+        # show up as one clearly-labeled block in the logs, and we get a
+        # final memory reading either way -- useful to distinguish "the code
+        # threw" (traceback below) from "the container got killed"
+        # (this line never gets a chance to run at all).
+        print("[Trainer] FATAL -- training run failed with an exception:")
+        traceback.print_exc()
+        log_peak_mem("at failure")
+        sys.exit(1)
