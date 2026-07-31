@@ -1,0 +1,11 @@
+numpy
+requests
+websockets
+scipy
+arch
+# v8: LSTM terminal-price model (inference only in the live bot; training
+# happens in the separate expiryrange-lstm-trainer service). CPU-only wheel
+# via the official PyTorch index -- much smaller/faster build than the
+# default PyPI package, which pulls in unneeded CUDA libraries.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
