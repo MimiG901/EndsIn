@@ -227,7 +227,7 @@ ABS_MAX_STAKE = float(os.getenv("ABS_MAX_STAKE", "2.00"))
 STAKE_GROWTH_UNLOCK_BALANCE = float(os.getenv("STAKE_GROWTH_UNLOCK_BALANCE", "15.00"))
 
 # ── Signal confirmation (reduces trade frequency / false positives) ───────
-CONFIRM_REQUIRED      = 0      # consecutive passes the top candidate must survive
+CONFIRM_REQUIRED      = 2      # consecutive passes the top candidate must survive
 CONFIRM_MIN_GAP_SECS  = 60     # minimum time between confirmation checks
 CONFIRM_MAX_AGE_SECS  = 600    # abandon a confirmation streak if it's been open
                                 # this long without completing (stale signal)
