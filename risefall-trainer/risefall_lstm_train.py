@@ -53,9 +53,26 @@ Plus:
                                     actually draws from -- see TRAIN_SYMBOLS
                                     below. (RISEFALL_TRAIN_SYMBOL, singular,
                                     still works as a one-symbol override.)
-  LSTM_MAX_TICKS                   default 300000 -- TOTAL tick budget
-                                    across the whole basket, divided evenly
-                                    per symbol.
+  LSTM_MAX_TICKS                   TOTAL tick budget across the whole
+                                    basket, divided evenly per symbol.
+                                    Defaults to 300000 for tick mode,
+                                    1800000 for minute mode (minute mode
+                                    needs far more raw ticks per symbol to
+                                    accumulate enough distinct one-minute
+                                    bars -- see WINDOW_SIZE_MINUTES).
+  LSTM_MAX_TRAIN_EXAMPLES          default 20000 -- caps the POOLED
+                                    training-example total across every
+                                    symbol (see cap_pooled_examples()).
+                                    Without this, wall-clock time scales
+                                    linearly with len(TRAIN_SYMBOLS): a
+                                    full 10-symbol basket with no cap
+                                    measured out to ~2 CPU-hours for one
+                                    MODEL_KIND run (main model + GRU/CNN
+                                    diagnostics all training on the full
+                                    pooled set). With the cap, well under
+                                    20 minutes.
+  LSTM_MAX_VAL_EXAMPLES            default 4000 -- same idea, validation
+                                    side.
   LSTM_REQUIRE_BEAT_PERSISTENCE    default "true" -- see BASELINE
                                     DIAGNOSTICS below; aborts the Supabase
                                     upload (keeping whatever model is
@@ -155,9 +172,33 @@ TRAIN_HISTORY_DAYS  = float(os.getenv("LSTM_TRAIN_HISTORY_DAYS", "5" if MODEL_KI
 # constant as TRAIN_SYMBOLS grows, rather than multiplying it by the
 # basket size. Tune LSTM_MAX_TICKS up (and/or trim TRAIN_SYMBOLS) if a
 # cron run risks running past the next scheduled trigger.
-MAX_TICKS = int(os.getenv("LSTM_MAX_TICKS", "300000"))
+#
+# Minute mode needs a MUCH bigger raw-tick budget than tick mode for the
+# same symbol: WINDOW_SIZE_MINUTES=200 means every labeled example needs
+# 200+ distinct one-minute bars of lookback, and the tick-mode default
+# (~30k ticks/symbol ~= 8 hours) resamples down to only ~500 minute bars
+# -- nowhere near enough to clear build_symbol_split()'s own 200-anchor
+# minimum per symbol once anchor striding is applied. Default scales up
+# 6x for MODEL_KIND=minute accordingly (override with LSTM_MAX_TICKS if
+# your basket size or Railway plan needs something different).
+_default_max_ticks = "300000" if MODEL_KIND == "tick" else "1800000"
+MAX_TICKS = int(os.getenv("LSTM_MAX_TICKS", _default_max_ticks))
 MAX_TICKS_PER_SYMBOL = max(20000, MAX_TICKS // max(len(TRAIN_SYMBOLS), 1))
 TICKS_PER_HISTORY_CALL = 5000
+
+# Pooling N symbols multiplies the labeled-example count by roughly N
+# relative to the old single-symbol design, but nothing else about epoch
+# count, DataLoader batch size, or the GRU/CNN diagnostic competitors
+# scaled down to compensate -- on a full 10-symbol basket this measured
+# out to ~1hr for the main model's 15 epochs PLUS another ~1hr for the
+# two diagnostic competitors (8 epochs each), i.e. the tick model alone
+# could take ~2 CPU-hours before the minute model even started. These two
+# caps bound total pooled example count (after the purge gap, split
+# proportionally per symbol) so wall-clock stays roughly constant
+# regardless of how many symbols TRAIN_SYMBOLS lists -- lower them further
+# if a run is still taking too long for your Railway plan/cron interval.
+LSTM_MAX_TRAIN_EXAMPLES = int(os.getenv("LSTM_MAX_TRAIN_EXAMPLES", "20000"))
+LSTM_MAX_VAL_EXAMPLES   = int(os.getenv("LSTM_MAX_VAL_EXAMPLES", "4000"))
 
 EPOCHS       = int(os.getenv("LSTM_EPOCHS", "15"))
 BATCH_SIZE   = int(os.getenv("LSTM_BATCH_SIZE", "64"))
@@ -519,6 +560,49 @@ def bagged_ensemble_loss(logits: torch.Tensor, yb: torch.Tensor,
         total = total + loss_fn(logits[h][mask], yb[mask])
         n_active += 1
     return total / max(n_active, 1)
+
+
+def cap_pooled_examples(symbol_splits: list, max_train: int, max_val: int) -> list:
+    """Proportionally subsamples each symbol's (already purged, already
+    chronologically split) train/val anchors so the POOLED total across
+    every symbol never exceeds max_train / max_val -- without this, wall-
+    clock time for both the main model and the GRU/CNN diagnostics below
+    scales linearly with len(TRAIN_SYMBOLS), which made a full 10-symbol
+    basket take multiple CPU-hours for a single MODEL_KIND run. Sampling
+    is uniform random within each symbol (seeded, so re-running with the
+    same data is reproducible) -- it doesn't bias toward any part of that
+    symbol's timeline, it just thins the density."""
+    n_train_total = sum(len(s["anchors_train"]) for s in symbol_splits)
+    n_val_total = sum(len(s["anchors_val"]) for s in symbol_splits)
+    if n_train_total <= max_train and n_val_total <= max_val:
+        return symbol_splits   # already under budget, nothing to do
+
+    rng = np.random.default_rng(20260802)
+    train_frac = min(1.0, max_train / max(n_train_total, 1))
+    val_frac = min(1.0, max_val / max(n_val_total, 1))
+    capped = []
+    for s in symbol_splits:
+        n_tr, n_va = len(s["anchors_train"]), len(s["anchors_val"])
+        keep_tr = max(1, int(round(n_tr * train_frac)))
+        keep_va = max(1, int(round(n_va * val_frac)))
+        idx_tr = np.sort(rng.choice(n_tr, size=min(keep_tr, n_tr), replace=False))
+        idx_va = np.sort(rng.choice(n_va, size=min(keep_va, n_va), replace=False))
+        capped.append({
+            "symbol": s["symbol"], "returns": s["returns"],
+            "anchors_train": s["anchors_train"][idx_tr],
+            "dn_train": s["dn_train"][idx_tr],
+            "y_train": s["y_train"][idx_tr],
+            "anchors_val": s["anchors_val"][idx_va],
+            "dn_val": s["dn_val"][idx_va],
+            "y_val": s["y_val"][idx_va],
+        })
+    new_train_total = sum(len(s["anchors_train"]) for s in capped)
+    new_val_total = sum(len(s["anchors_val"]) for s in capped)
+    print(f"[Trainer:{MODEL_KIND}] Capped pooled examples for wall-clock: "
+          f"{n_train_total} -> {new_train_total} train, {n_val_total} -> {new_val_total} val "
+          f"across {len(capped)} symbols (LSTM_MAX_TRAIN_EXAMPLES={max_train}, "
+          f"LSTM_MAX_VAL_EXAMPLES={max_val}).")
+    return capped
 
 
 def build_symbol_split(symbol: str, prices: np.ndarray, returns: np.ndarray) -> Optional[dict]:
@@ -1116,6 +1200,9 @@ async def main():
 
     print(f"[Trainer:{MODEL_KIND}] Training pooled across {len(symbol_splits)}/"
           f"{len(TRAIN_SYMBOLS)} symbols: {[s['symbol'] for s in symbol_splits]}")
+
+    symbol_splits = cap_pooled_examples(symbol_splits, LSTM_MAX_TRAIN_EXAMPLES,
+                                        LSTM_MAX_VAL_EXAMPLES)
 
     result = train_model(symbol_splits)
     val_loss, val_acc = result["val_loss"], result["val_acc"]
