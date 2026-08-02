@@ -55,30 +55,47 @@ without waiting for the schedule.
 
 For **each** of `MODEL_KIND=tick` and `MODEL_KIND=minute`:
 
-1. Pulls recent tick history from Deriv (`LSTM_TRAIN_HISTORY_DAYS`,
-   capped at `LSTM_MAX_TICKS`), resampling into minute bars first if
-   `MODEL_KIND=minute` (see `build_minute_bars()`).
-2. Builds labeled direction examples, chronologically splits train/val,
-   and **purges** any training example whose label horizon reaches into
-   the validation window — a walk-forward split alone isn't enough here,
-   since a label looks forward by up to `max(CANDIDATE_DURATIONS)`.
-3. Computes return-normalization stats from the **training split only**
-   and bakes them into the model as persisted buffers (`return_mean`/
-   `return_std`) — the exact same transform is then applied automatically
-   at live-bot inference time, no separate scaler to keep in sync.
+1. Fetches recent tick history **separately for every symbol in
+   `RISEFALL_TRAIN_SYMBOLS`** (default basket covers both symbol families
+   the live bot actually draws from — see `risefall-bot/README.md`'s
+   "What Gate 6 actually changes"), resampling into minute bars first if
+   `MODEL_KIND=minute` (`build_minute_bars()`). `LSTM_MAX_TICKS` is a
+   TOTAL budget divided evenly across the basket, so adding symbols
+   doesn't multiply wall-clock time.
+2. Per symbol: builds labeled direction examples, chronologically splits
+   train/val, and **purges** any training example whose label horizon
+   reaches into that symbol's own validation window (`build_symbol_split()`
+   — a walk-forward split alone isn't enough, since a label looks forward
+   by up to `max(CANDIDATE_DURATIONS)`). One symbol's returns are never
+   mixed into another symbol's index space.
+3. Pools every symbol's train set (and separately, val set) into one
+   combined training run via `torch.utils.data.ConcatDataset` — there's
+   still exactly **one served state_dict per `MODEL_KIND`**, not one per
+   symbol, since Gate 6 in the bot applies whichever model is current to
+   every symbol it evaluates. Normalization is **per-window and local**
+   (`local_normalize()` in `risefall_lstm_model.py`, z-scores each window
+   against its own mean/std) rather than one global scalar baked into the
+   model — that's what makes pooling symbols of very different native
+   volatility (a Volatility 100 index's returns are roughly 10x a
+   Volatility 10 index's) into one training set sound, and it's why this
+   model generalizes even to a symbol outside the training basket.
 4. Trains the served `RiseFallWinClassifier` deep ensemble (dilated causal
    conv front-end → 3-layer LSTM w/ inter-layer dropout → attention pool →
    5 bagged heads).
-5. Runs it against **five baselines** on the identical purged validation
-   split — see `run_baseline_diagnostics()`:
+5. Runs it against **five baselines**, each computed per-symbol on that
+   symbol's own purged validation split and then pooled in the same order
+   for a fair comparison against the LSTM's pooled val predictions — see
+   `run_baseline_diagnostics()`:
    - **Persistence** (naive "whatever just happened, keep happening")
-   - **AR(1) + Hurst exponent** (linear autocorrelation baseline; Hurst is
-     logged as a standalone diagnostic of how much real short-range
-     memory the process has at all)
+   - **AR(1) + Hurst exponent** (linear autocorrelation baseline, fit
+     per symbol; Hurst is logged per symbol too, as a standalone
+     diagnostic of how much real short-range memory each process has)
    - **HistGradientBoostingClassifier** on hand-engineered return-window
-     features (multi-scale mean/std, skew, streak length)
-   - **Compact GRU** and **compact dilated causal CNN** (same input, cheap
-     point-estimate competitors — not the served ensemble)
+     features (multi-scale mean/std, skew, streak length), trained on the
+     same pooled multi-symbol set the LSTM sees
+   - **Compact GRU** and **compact dilated causal CNN** (same pooled
+     input incl. `local_normalize()`, cheap point-estimate competitors —
+     not the served ensemble)
 
    None of the five are served to the bot; this is purely a "is the extra
    complexity earning its keep" report, logged to console and uploaded
@@ -91,15 +108,29 @@ For **each** of `MODEL_KIND=tick` and `MODEL_KIND=minute`:
    comparison table in the logs (or the `baseline_comparison` column) and
    decide for yourself whether a given run's numbers are worth trusting.
 
+   **Read this before flipping `LSTM_ENABLED=true` on the bot**: Gate 6 in
+   `risefall-bot` is a HARD veto on any direction disagreement, not a
+   diagnostic — it can meaningfully cut trade frequency. Watch a few cron
+   cycles of `baseline_comparison` first.
+
 ## Safety / cost notes
 
 - This service never places a trade — it's read-only against the Deriv
   API (`ticks_history`).
+- The default `RISEFALL_TRAIN_SYMBOLS` basket has 10 symbols. `LSTM_MAX_TICKS`
+  auto-divides across however many symbols are configured, so wall-clock
+  time per `MODEL_KIND` run stays roughly constant as the basket grows —
+  but each symbol still needs its own `active_symbols`-style history pull
+  and its own labeled-example construction pass, so more symbols still
+  means more *overhead* even at a fixed total tick budget. If runs start
+  taking long enough to risk missing the next 2h trigger, trim
+  `RISEFALL_TRAIN_SYMBOLS` before reaching for `LSTM_EPOCHS`/
+  `LSTM_COMBOS_PER_ANCHOR`.
 - `LSTM_TRAIN_HISTORY_DAYS` for the minute model defaults to 30 days,
   since 30 days of ticks resample down to a much smaller number of
   distinct minute bars than the tick model needs directly. That's a much
-  larger `ticks_history` pull — expect the minute run to take noticeably
-  longer than the tick run in the same cron cycle.
+  larger `ticks_history` pull per symbol — expect the minute run to take
+  noticeably longer than the tick run in the same cron cycle.
 - Each run trains 3 torch models (the served ensemble + the GRU/CNN
   diagnostics) plus one sklearn GBM, twice per cron trigger (tick +
   minute) — this is meaningfully more CPU time per run than a bare

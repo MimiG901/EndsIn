@@ -48,13 +48,36 @@ Env vars required (same as expiryrange_lstm_train.py):
   SUPABASE_URL, SUPABASE_KEY
 Plus:
   MODEL_KIND                       "tick" or "minute" (required)
-  RISEFALL_TRAIN_SYMBOL            default "1HZ10V"
+  RISEFALL_TRAIN_SYMBOLS           comma-separated symbol basket, default
+                                    covers both families the live bot
+                                    actually draws from -- see TRAIN_SYMBOLS
+                                    below. (RISEFALL_TRAIN_SYMBOL, singular,
+                                    still works as a one-symbol override.)
+  LSTM_MAX_TICKS                   default 300000 -- TOTAL tick budget
+                                    across the whole basket, divided evenly
+                                    per symbol.
   LSTM_REQUIRE_BEAT_PERSISTENCE    default "true" -- see BASELINE
                                     DIAGNOSTICS below; aborts the Supabase
                                     upload (keeping whatever model is
                                     already live) if the LSTM doesn't beat
                                     a naive persistence baseline out of
                                     sample on this run's val split.
+
+MULTI-SYMBOL TRAINING -- one shared model, a pooled basket of symbols
+----------------------------------------------------------------------
+There's still exactly one served state_dict per MODEL_KIND (not one per
+symbol) -- risefall_bot_v4_hmm_gbm.py's Gate 6 applies whichever tick/
+minute model is current to EVERY symbol it evaluates. Since the live
+bot's symbol universe is discovered dynamically every deep calibration
+(fetch_tradable_symbols()/select_top_1hz()) and isn't fully known even at
+training time, this file fetches history and builds labeled examples
+SEPARATELY per symbol in TRAIN_SYMBOLS (never mixing one symbol's return
+series with another's -- see build_symbol_split()), then pools all of
+them into one combined train/val set via torch's ConcatDataset. Combined
+with local_normalize() in risefall_lstm_model.py (per-window normalization,
+not a single global scalar), the served model ends up scale-invariant
+across the whole basket rather than calibrated to whichever one symbol
+happened to be hardcoded before.
 
 BASELINE DIAGNOSTICS -- "is the LSTM actually earning its keep?"
 ----------------------------------------------------------------------
@@ -87,14 +110,14 @@ import websockets
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from sklearn.ensemble import HistGradientBoostingClassifier
 
 from risefall_lstm_model import (
     RiseFallWinClassifier, WINDOW_SIZE_TICKS, WINDOW_SIZE_MINUTES,
     LSTM_HIDDEN, NUM_LSTM_LAYERS, N_ENSEMBLE_HEADS,
     CANDIDATE_DURATIONS_TICKS, CANDIDATE_DURATIONS_MINUTES,
-    normalize_duration_count,
+    normalize_duration_count, local_normalize,
 )
 
 # =============================================================================
@@ -106,12 +129,34 @@ if MODEL_KIND not in ("tick", "minute"):
           f"got {MODEL_KIND!r}")
     sys.exit(1)
 
-SYMBOL              = os.getenv("RISEFALL_TRAIN_SYMBOL", "1HZ10V")
+_raw_symbols = os.getenv("RISEFALL_TRAIN_SYMBOLS", os.getenv("RISEFALL_TRAIN_SYMBOL", ""))
+TRAIN_SYMBOLS = [s.strip() for s in _raw_symbols.split(",") if s.strip()] or [
+    # Default basket spans the same TWO discovery families the live bot
+    # actually draws from (see fetch_tradable_symbols()/select_top_1hz()
+    # in risefall_bot_v4_hmm_gbm.py): the classic R_* volatility indices
+    # and the 1HZ_* family, low-vol through high-vol in both. The bot's
+    # actual live basket at any given moment is a data-driven SUBSET of
+    # roughly this universe (up to 3 of the 1HZ symbols by tick
+    # consistency, plus whichever R_* symbols pass a contracts_for check)
+    # -- training across the whole plausible universe means the shared
+    # model has seen something close to whatever the bot ends up trading,
+    # rather than overfitting to one symbol that might not even be in the
+    # live basket this cycle.
+    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+    "R_10", "R_25", "R_50", "R_75", "R_100",
+]
 TRAIN_HISTORY_DAYS  = float(os.getenv("LSTM_TRAIN_HISTORY_DAYS", "5" if MODEL_KIND == "tick" else "30"))
 # Minute model needs far more wall-clock history to accumulate enough
 # distinct minute bars -- 5 days of ticks is ~200k+ tick examples but only
 # ~7200 minute bars, so it defaults to a longer pull.
-MAX_TICKS           = int(os.getenv("LSTM_MAX_TICKS", "300000"))
+#
+# MAX_TICKS is a TOTAL budget across the whole symbol basket, divided
+# evenly per symbol -- this is what keeps wall-clock time roughly
+# constant as TRAIN_SYMBOLS grows, rather than multiplying it by the
+# basket size. Tune LSTM_MAX_TICKS up (and/or trim TRAIN_SYMBOLS) if a
+# cron run risks running past the next scheduled trigger.
+MAX_TICKS = int(os.getenv("LSTM_MAX_TICKS", "300000"))
+MAX_TICKS_PER_SYMBOL = max(20000, MAX_TICKS // max(len(TRAIN_SYMBOLS), 1))
 TICKS_PER_HISTORY_CALL = 5000
 
 EPOCHS       = int(os.getenv("LSTM_EPOCHS", "15"))
@@ -476,14 +521,21 @@ def bagged_ensemble_loss(logits: torch.Tensor, yb: torch.Tensor,
     return total / max(n_active, 1)
 
 
-def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
+def build_symbol_split(symbol: str, prices: np.ndarray, returns: np.ndarray) -> Optional[dict]:
+    """Builds this ONE symbol's labeled examples, chronological train/val
+    split, and purge gap -- entirely from that symbol's own price/return
+    series. Never mixes ticks/returns across symbols; the returned dict's
+    anchors always index into its own `returns` array. Returns None (with
+    a log line, not an exception) if this symbol didn't yield enough
+    usable examples -- one thin symbol shouldn't abort the whole run."""
     anchors, dur_norms, y = build_labeled_examples(
         prices, returns, WINDOW_SIZE, CANDIDATE_DURATIONS)
-    if len(anchors) < 500:
-        raise RuntimeError(f"Only {len(anchors)} labeled examples available (need >=500) "
-                           f"-- not enough history fetched to train reliably.")
+    if len(anchors) < 200:
+        print(f"[Trainer:{MODEL_KIND}] {symbol}: only {len(anchors)} labeled examples "
+              f"-- skipping this symbol.")
+        return None
 
-    n_val = max(int(len(anchors) * VAL_FRACTION), 50)
+    n_val = max(int(len(anchors) * VAL_FRACTION), 20)
     anchors_train, dn_train, y_train = anchors[:-n_val], dur_norms[:-n_val], y[:-n_val]
     anchors_val, dn_val, y_val       = anchors[-n_val:], dur_norms[-n_val:], y[-n_val:]
 
@@ -500,35 +552,61 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
     purge_horizon = max(CANDIDATE_DURATIONS)
     keep_mask = (anchors_train + purge_horizon) < val_start_t
     n_purged = int((~keep_mask).sum())
-    anchors_train = anchors_train[keep_mask]
-    dn_train = dn_train[keep_mask]
-    y_train = y_train[keep_mask]
-    print(f"[Trainer:{MODEL_KIND}] Purged {n_purged} train anchors whose label "
-          f"horizon crossed into the validation region "
-          f"({len(anchors_train)} train / {len(anchors_val)} val examples remain).")
+    anchors_train, dn_train, y_train = anchors_train[keep_mask], dn_train[keep_mask], y_train[keep_mask]
 
-    # ── Normalization stats from TRAINING data only ─────────────────────────
-    # Everything at/after val_start_t is held out, so this pool never touches
-    # a single return the model will be validated or served on.
-    train_return_pool = returns[:val_start_t]
-    ret_mean = float(np.mean(train_return_pool)) if len(train_return_pool) else 0.0
-    ret_std  = float(np.std(train_return_pool)) if len(train_return_pool) else 1.0
-    print(f"[Trainer:{MODEL_KIND}] Normalization stats (train-only): "
-          f"mean={ret_mean:.3e} std={ret_std:.3e}")
+    print(f"[Trainer:{MODEL_KIND}] {symbol}: {len(anchors_train)} train / {len(anchors_val)} "
+          f"val examples ({n_purged} purged at the train/val boundary).")
+    if len(anchors_train) < 100 or len(anchors_val) < 20:
+        print(f"[Trainer:{MODEL_KIND}] {symbol}: too few examples after purge -- "
+              f"skipping this symbol.")
+        return None
+
+    return {
+        "symbol": symbol, "returns": returns,
+        "anchors_train": anchors_train, "dn_train": dn_train, "y_train": y_train,
+        "anchors_val": anchors_val, "dn_val": dn_val, "y_val": y_val,
+    }
+
+
+def train_model(symbol_splits: list) -> dict:
+    """Trains ONE shared ensemble pooled across every symbol in
+    symbol_splits (each contributed by build_symbol_split(), each keeping
+    its own returns array -- see that function's docstring). Per-window
+    local_normalize() inside the model (risefall_lstm_model.py) is what
+    makes pooling symbols of very different native volatility scales into
+    one training set sound, rather than something that needs a matching
+    per-symbol normalization step here."""
+    train_ds = ConcatDataset([
+        RiseFallExampleDataset(s["returns"], s["anchors_train"], s["dn_train"],
+                               s["y_train"], WINDOW_SIZE)
+        for s in symbol_splits
+    ])
+    val_ds = ConcatDataset([
+        RiseFallExampleDataset(s["returns"], s["anchors_val"], s["dn_val"],
+                               s["y_val"], WINDOW_SIZE)
+        for s in symbol_splits
+    ])
+    n_train_total = sum(len(s["anchors_train"]) for s in symbol_splits)
+    n_val_total = sum(len(s["anchors_val"]) for s in symbol_splits)
+    if n_train_total < 500:
+        raise RuntimeError(f"Only {n_train_total} pooled training examples across "
+                           f"{len(symbol_splits)} symbol(s) (need >=500) -- not enough "
+                           f"history fetched to train reliably.")
 
     gc.collect()
     log_peak_mem("before building datasets/loaders")
-    train_ds = RiseFallExampleDataset(returns, anchors_train, dn_train, y_train, WINDOW_SIZE)
-    val_ds   = RiseFallExampleDataset(returns, anchors_val, dn_val, y_val, WINDOW_SIZE)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    # shuffle=False here matters: run_baseline_diagnostics() reconstructs
+    # y_val by concatenating each symbol_splits[i]["y_val"] in list order,
+    # which only lines up with val_probs below if ConcatDataset+DataLoader
+    # iterate in that same deterministic order.
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
     torch.set_num_threads(1)
 
     model = RiseFallWinClassifier(kind=MODEL_KIND, window_size=WINDOW_SIZE,
                                   hidden_size=LSTM_HIDDEN, num_layers=NUM_LSTM_LAYERS,
                                   n_heads=N_ENSEMBLE_HEADS)
-    model.set_normalization_stats(ret_mean, ret_std)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     loss_fn = torch.nn.BCEWithLogitsLoss()
     bag_rng = torch.Generator().manual_seed(1234)
@@ -591,16 +669,29 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
             val_probs_chunks.append(torch.sigmoid(logits.mean(dim=0)).numpy())
     val_probs = np.concatenate(val_probs_chunks) if val_probs_chunks else np.array([])
 
+    # Re-run inference with the BEST checkpoint (not necessarily the last
+    # epoch's weights) to get the val predictions the diagnostics/baseline
+    # comparison below actually score against.
+    model.load_state_dict(best_state)
+    model.eval()
+    val_probs_chunks = []
+    with torch.no_grad():
+        for xb, db, yb in val_loader:
+            logits = model(xb, db)
+            val_probs_chunks.append(torch.sigmoid(logits.mean(dim=0)).numpy())
+    val_probs = np.concatenate(val_probs_chunks) if val_probs_chunks else np.array([])
+    y_val_concat = (np.concatenate([s["y_val"] for s in symbol_splits])
+                    if symbol_splits else np.array([]))
+
     return {
         "state_dict": best_state,
         "val_loss": best_val_loss,
         "val_acc": best_val_acc,
-        "n_train": len(anchors_train),
-        "n_val": len(anchors_val),
+        "n_train": n_train_total,
+        "n_val": n_val_total,
         "val_probs": val_probs,          # LSTM ensemble's own val predictions
-        "anchors_train": anchors_train, "dn_train": dn_train, "y_train": y_train,
-        "anchors_val": anchors_val, "dn_val": dn_val, "y_val": y_val,
-        "ret_mean": ret_mean, "ret_std": ret_std,
+        "y_val": y_val_concat,           # same order (ConcatDataset, shuffle=False)
+        "symbol_splits": symbol_splits,
     }
 
 
@@ -762,7 +853,7 @@ class _DiagGRUClassifier(nn.Module):
         self.head = nn.Sequential(nn.Linear(hidden + 1, 24), nn.GELU(), nn.Linear(24, 1))
 
     def forward(self, x, d):
-        _, h_n = self.gru(x)
+        _, h_n = self.gru(local_normalize(x))
         return self.head(torch.cat([h_n[-1], d], dim=1)).squeeze(-1)
 
 
@@ -787,7 +878,7 @@ class _DiagDilatedCNNClassifier(nn.Module):
         self.head = nn.Sequential(nn.Linear(channels + 1, 24), nn.GELU(), nn.Linear(24, 1))
 
     def forward(self, x, d):
-        h = self.in_proj(x.transpose(1, 2))
+        h = self.in_proj(local_normalize(x).transpose(1, 2))
         for block in self.blocks:
             h = block(h)
         return self.head(torch.cat([h.mean(dim=2), d], dim=1)).squeeze(-1)
@@ -823,46 +914,83 @@ def _train_diag_torch_model(model: nn.Module, train_loader, val_loader,
             "brier": _brier(best_probs, y_val), "probs": best_probs}
 
 
-def run_baseline_diagnostics(result: dict, returns: np.ndarray) -> dict:
+def run_baseline_diagnostics(result: dict) -> dict:
     """Runs every baseline from the model-review doc against the SAME
-    purged val split the LSTM ensemble was scored on, logs a comparison
-    table, and returns a JSON-safe summary (no raw prob arrays) for the
-    Supabase meta row.
+    per-symbol purged val splits the LSTM ensemble was pooled-trained and
+    scored on, logs a comparison table, and returns a JSON-safe summary
+    (no raw prob arrays) for the Supabase meta row.
+
+    Each baseline is computed PER SYMBOL (never mixing one symbol's
+    returns into another's index space) and then concatenated in the same
+    order as result["y_val"], so every baseline's accuracy/brier is
+    directly comparable to the LSTM's.
 
     Deliberately non-fatal: any individual baseline failing is caught and
     logged, never blocks the LSTM's own upload -- these are diagnostics,
     not a hard gate (except the persistence check, gated separately in
     main() via LSTM_REQUIRE_BEAT_PERSISTENCE)."""
-    anchors_val, y_val, dn_val = result["anchors_val"], result["y_val"], result["dn_val"]
-    anchors_train, dn_train, y_train = (result["anchors_train"], result["dn_train"],
-                                        result["y_train"])
-    lstm_probs = result["val_probs"]
+    symbol_splits = result["symbol_splits"]
+    lstm_probs, y_val = result["val_probs"], result["y_val"]
 
     baselines = []
-    try:
-        baselines.append(_persistence_baseline(returns, anchors_val, y_val))
-    except Exception as e:
-        print(f"[Trainer:{MODEL_KIND}] [diagnostic] persistence baseline failed: {e}")
+
+    persistence_parts, ar1_parts, hurst_by_symbol, phi_by_symbol = [], [], {}, {}
+    for s in symbol_splits:
+        try:
+            pb = _persistence_baseline(s["returns"], s["anchors_val"], s["y_val"])
+            persistence_parts.append(pb["probs"])
+        except Exception as e:
+            print(f"[Trainer:{MODEL_KIND}] [diagnostic] persistence baseline failed "
+                  f"for {s['symbol']}: {e}")
+            persistence_parts.append(np.full(len(s["y_val"]), 0.5, dtype=np.float32))
+        try:
+            val_start_t = int(s["anchors_val"][0]) if len(s["anchors_val"]) else len(s["returns"])
+            ab = _ar1_baseline(s["returns"], s["returns"][:val_start_t], s["anchors_val"], s["y_val"])
+            ar1_parts.append(ab["probs"])
+            hurst_by_symbol[s["symbol"]] = ab["hurst"]
+            phi_by_symbol[s["symbol"]] = ab["phi"]
+        except Exception as e:
+            print(f"[Trainer:{MODEL_KIND}] [diagnostic] AR(1)/Hurst baseline failed "
+                  f"for {s['symbol']}: {e}")
+            ar1_parts.append(np.full(len(s["y_val"]), 0.5, dtype=np.float32))
+
+    if persistence_parts and sum(len(p) for p in persistence_parts) == len(y_val):
+        probs = np.concatenate(persistence_parts)
+        baselines.append({"name": "persistence", "accuracy": _accuracy(probs, y_val),
+                          "brier": _brier(probs, y_val), "probs": probs})
+    if ar1_parts and sum(len(p) for p in ar1_parts) == len(y_val):
+        probs = np.concatenate(ar1_parts)
+        baselines.append({"name": "AR(1)", "accuracy": _accuracy(probs, y_val),
+                          "brier": _brier(probs, y_val), "probs": probs})
 
     try:
-        val_start_t = int(anchors_val[0]) if len(anchors_val) else len(returns)
-        baselines.append(_ar1_baseline(returns, returns[:val_start_t], anchors_val, y_val))
-    except Exception as e:
-        print(f"[Trainer:{MODEL_KIND}] [diagnostic] AR(1)/Hurst baseline failed: {e}")
-
-    try:
-        baselines.append(_gbm_baseline(returns, anchors_train, dn_train, y_train,
-                                       anchors_val, dn_val, y_val, WINDOW_SIZE))
+        X_train = np.concatenate([
+            _engineer_features(s["returns"], s["anchors_train"], s["dn_train"], WINDOW_SIZE)
+            for s in symbol_splits])
+        y_train_pooled = np.concatenate([s["y_train"] for s in symbol_splits])
+        X_val = np.concatenate([
+            _engineer_features(s["returns"], s["anchors_val"], s["dn_val"], WINDOW_SIZE)
+            for s in symbol_splits])
+        clf = HistGradientBoostingClassifier(max_iter=150, max_depth=4, random_state=42)
+        clf.fit(X_train, y_train_pooled)
+        probs = clf.predict_proba(X_val)[:, 1].astype(np.float32)
+        baselines.append({"name": "GBM (engineered features)", "accuracy": _accuracy(probs, y_val),
+                          "brier": _brier(probs, y_val), "probs": probs})
     except Exception as e:
         print(f"[Trainer:{MODEL_KIND}] [diagnostic] GBM baseline failed: {e}")
 
+    # GRU / CNN: same pooled ConcatDataset pattern as train_model(). Both
+    # apply local_normalize() internally now (same as the served model),
+    # so no separate normalized-returns array is needed here anymore.
     diag_epochs = min(EPOCHS, 8)   # cheaper than the served model on purpose
-    norm_returns = ((returns - result["ret_mean"]) /
-                    (result["ret_std"] if result["ret_std"] > 1e-9 else 1.0)).astype(np.float32)
-    diag_train_ds = RiseFallExampleDataset(norm_returns, anchors_train, dn_train, y_train, WINDOW_SIZE)
-    diag_val_ds   = RiseFallExampleDataset(norm_returns, anchors_val, dn_val, y_val, WINDOW_SIZE)
-    diag_train_loader = DataLoader(diag_train_ds, batch_size=BATCH_SIZE, shuffle=True)
-    diag_val_loader   = DataLoader(diag_val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    diag_train_loader = DataLoader(
+        ConcatDataset([RiseFallExampleDataset(s["returns"], s["anchors_train"], s["dn_train"],
+                                              s["y_train"], WINDOW_SIZE) for s in symbol_splits]),
+        batch_size=BATCH_SIZE, shuffle=True)
+    diag_val_loader = DataLoader(
+        ConcatDataset([RiseFallExampleDataset(s["returns"], s["anchors_val"], s["dn_val"],
+                                              s["y_val"], WINDOW_SIZE) for s in symbol_splits]),
+        batch_size=BATCH_SIZE, shuffle=False)
 
     try:
         baselines.append(_train_diag_torch_model(
@@ -878,10 +1006,15 @@ def run_baseline_diagnostics(result: dict, returns: np.ndarray) -> dict:
         print(f"[Trainer:{MODEL_KIND}] [diagnostic] dilated CNN baseline failed: {e}")
 
     lstm_acc, lstm_brier = _accuracy(lstm_probs, y_val), _brier(lstm_probs, y_val)
-    print(f"\n[Trainer:{MODEL_KIND}] ── Baseline comparison (val, n={len(y_val)}) ──────────────")
+    print(f"\n[Trainer:{MODEL_KIND}] ── Baseline comparison (val, n={len(y_val)}, "
+          f"{len(symbol_splits)} symbols pooled) ──────────────")
     print(f"[Trainer:{MODEL_KIND}]   {'LSTM ensemble (served)':<28} acc={lstm_acc:.3f}  brier={lstm_brier:.4f}")
     for b in baselines:
         print(f"[Trainer:{MODEL_KIND}]   {b['name']:<28} acc={b['accuracy']:.3f}  brier={b['brier']:.4f}")
+    if hurst_by_symbol:
+        hurst_str = ", ".join(f"{k}={v:.3f}" if v is not None else f"{k}=n/a"
+                              for k, v in hurst_by_symbol.items())
+        print(f"[Trainer:{MODEL_KIND}]   Hurst (train-period, per symbol): {hurst_str}")
 
     persistence_probs = next((b["probs"] for b in baselines if b["name"] == "persistence"), None)
     corr_with_persistence = None
@@ -903,10 +1036,13 @@ def run_baseline_diagnostics(result: dict, returns: np.ndarray) -> dict:
     print(f"[Trainer:{MODEL_KIND}] ────────────────────────────────────────────────────────\n")
 
     return {
+        "symbols": [s["symbol"] for s in symbol_splits],
         "lstm_accuracy": lstm_acc,
         "lstm_brier": lstm_brier,
         "baselines": [{"name": b["name"], "accuracy": b["accuracy"], "brier": b["brier"]}
                      for b in baselines],
+        "hurst_by_symbol": {k: (float(v) if v is not None else None)
+                           for k, v in hurst_by_symbol.items()},
         "corr_lstm_persistence": corr_with_persistence,
         "beats_best_baseline": bool(beats_best_baseline),
     }
@@ -917,53 +1053,75 @@ def run_baseline_diagnostics(result: dict, returns: np.ndarray) -> dict:
 # =============================================================================
 async def main():
     print(f"[Trainer:{MODEL_KIND}] Starting RISEFALL LSTM training run ({MODEL_KIND}) "
-          f"for {SYMBOL} at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+          f"for {len(TRAIN_SYMBOLS)} symbol(s) [{', '.join(TRAIN_SYMBOLS)}] "
+          f"at {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
 
-    target_ticks = min(int(TRAIN_HISTORY_DAYS * 86400), MAX_TICKS)
     client = MinimalDerivClient(DERIV_APP_ID, DERIV_API_TOKEN, DERIV_ACCOUNT_TYPE, DERIV_ACCOUNT_ID)
     await client.connect()
+    symbol_splits = []
+    total_ticks_fetched = 0
     try:
-        times, prices = await fetch_full_history(client, SYMBOL, target_ticks)
+        for symbol in TRAIN_SYMBOLS:
+            target_ticks = min(int(TRAIN_HISTORY_DAYS * 86400), MAX_TICKS_PER_SYMBOL)
+            try:
+                times, prices = await fetch_full_history(client, symbol, target_ticks)
+            except Exception as e:
+                print(f"[Trainer:{MODEL_KIND}] {symbol}: history fetch failed ({e}) -- "
+                      f"skipping this symbol.")
+                continue
+
+            if len(prices) < 1000:
+                print(f"[Trainer:{MODEL_KIND}] {symbol}: only {len(prices)} ticks fetched -- "
+                      f"skipping (need a tradable/active symbol with real history).")
+                continue
+            total_ticks_fetched += len(prices)
+            log_peak_mem(f"after fetching {symbol} history")
+
+            if MODEL_KIND == "minute":
+                bar_epochs, bar_prices = build_minute_bars(times, prices)
+                if len(bar_prices) < 1000:
+                    print(f"[Trainer:{MODEL_KIND}] {symbol}: only {len(bar_prices)} minute bars "
+                          f"built from {len(prices)} ticks -- skipping (need a longer "
+                          f"LSTM_TRAIN_HISTORY_DAYS pull for this symbol).")
+                    continue
+                prices_for_training = bar_prices.astype(np.float32)
+                print(f"[Trainer:{MODEL_KIND}] {symbol}: resampled {len(prices)} ticks -> "
+                      f"{len(bar_prices)} minute bars spanning "
+                      f"~{(bar_epochs[-1]-bar_epochs[0])/86400:.2f} days")
+            else:
+                prices_for_training = prices.astype(np.float32)
+                print(f"[Trainer:{MODEL_KIND}] {symbol}: fetched {len(prices)} ticks "
+                      f"spanning ~{len(prices)/86400:.2f} days")
+
+            # Log-returns, not simple returns -- more defensible generally
+            # (additive across horizons, symmetric treatment of up/down
+            # moves of the same magnitude). Synthetic index prices are
+            # always strictly positive, but floor them defensively anyway
+            # rather than let a bad tick produce a NaN that silently
+            # poisons every window it touches.
+            safe_prices = np.maximum(prices_for_training, 1e-9)
+            returns = np.diff(np.log(safe_prices)).astype(np.float32)
+            gc.collect()
+
+            split = build_symbol_split(symbol, prices_for_training, returns)
+            if split is not None:
+                symbol_splits.append(split)
     finally:
         await client.close()
 
-    if len(prices) < 1000:
-        print(f"[Trainer:{MODEL_KIND}] Only {len(prices)} ticks fetched -- aborting, "
-              f"not enough data to train on.")
+    if not symbol_splits:
+        print(f"[Trainer:{MODEL_KIND}] No symbol in TRAIN_SYMBOLS produced enough usable "
+              f"data -- aborting this run entirely.")
         sys.exit(1)
-    log_peak_mem("after fetching tick history")
 
-    if MODEL_KIND == "minute":
-        bar_epochs, bar_prices = build_minute_bars(times, prices)
-        if len(bar_prices) < 1000:
-            print(f"[Trainer:{MODEL_KIND}] Only {len(bar_prices)} minute bars built from "
-                  f"{len(prices)} ticks -- aborting, need a longer TRAIN_HISTORY_DAYS pull.")
-            sys.exit(1)
-        prices_for_training = bar_prices.astype(np.float32)
-        print(f"[Trainer:{MODEL_KIND}] Resampled {len(prices)} ticks -> {len(bar_prices)} "
-              f"minute bars spanning ~{(bar_epochs[-1]-bar_epochs[0])/86400:.2f} days")
-    else:
-        prices_for_training = prices.astype(np.float32)
-        print(f"[Trainer:{MODEL_KIND}] Fetched {len(prices)} ticks "
-              f"spanning ~{len(prices)/86400:.2f} days")
+    print(f"[Trainer:{MODEL_KIND}] Training pooled across {len(symbol_splits)}/"
+          f"{len(TRAIN_SYMBOLS)} symbols: {[s['symbol'] for s in symbol_splits]}")
 
-    # Log-returns, not simple returns -- the earlier `diff(p)/p[:-1]` was
-    # numerically close for small tick-to-tick moves but not exactly what
-    # the module docstring already claimed, and log-returns are the more
-    # defensible choice generally (additive across horizons, symmetric
-    # treatment of up/down moves of the same magnitude). Synthetic index
-    # prices are always strictly positive, but floor them defensively
-    # anyway rather than let a bad tick produce a NaN that silently
-    # poisons every window it touches.
-    safe_prices = np.maximum(prices_for_training, 1e-9)
-    returns = np.diff(np.log(safe_prices)).astype(np.float32)
-    gc.collect()
-
-    result = train_model(prices_for_training, returns)
+    result = train_model(symbol_splits)
     val_loss, val_acc = result["val_loss"], result["val_acc"]
     print(f"[Trainer:{MODEL_KIND}] Best model: val_bce={val_loss:.5f}  val_acc={val_acc:.3f}")
 
-    diagnostics = run_baseline_diagnostics(result, returns)
+    diagnostics = run_baseline_diagnostics(result)
 
     # Optional hard gate on the most basic sanity floor: if the LSTM can't
     # even beat a naive persistence baseline out-of-sample, the doc's
@@ -989,8 +1147,8 @@ async def main():
 
     meta = {
         "trained_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "symbol": SYMBOL,
-        "n_ticks_used": int(len(prices)),
+        "symbol": ",".join(s["symbol"] for s in symbol_splits),
+        "n_ticks_used": int(total_ticks_fetched),
         "n_train_examples": int(result["n_train"]),
         "n_val_examples": int(result["n_val"]),
         "val_loss": float(val_loss),

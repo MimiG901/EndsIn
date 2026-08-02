@@ -77,17 +77,15 @@ duration is being scored, so the live bot encodes once per symbol per cycle
 and batches every candidate duration in CANDIDATE_DURATIONS /
 CANDIDATE_DURATIONS_MINUTES through the cheap head in one forward pass.
 
-NORMALIZATION IS BAKED INTO THE MODEL, NOT A SEPARATE SCALER OBJECT
+NORMALIZATION IS PER-WINDOW AND LOCAL, NOT A GLOBAL BAKED-IN SCALAR
 ----------------------------------------------------------------------
-return_mean/return_std are `register_buffer`s, not plain attributes -- that
-means they save/load automatically as part of state_dict, the same as any
-learned weight. risefall_lstm_train.py computes them from the TRAINING
-split only (never validation, never the full pulled series -- see that
-file's train_model()) and calls set_normalization_stats() once before
-training starts. Every subsequent encode() call, whether from forward()
-during training or compute_hidden() at live-bot inference time, applies
-that exact same transform. There's no separate scaler pickle to keep in
-sync, forget to ship, or accidentally compute from the wrong data window.
+See local_normalize() below. Each window is z-scored against its own
+mean/std at both train and inference time -- there's no scaler object or
+persisted buffer to keep in sync, and critically, it generalizes to any
+symbol regardless of that symbol's native volatility scale, which matters
+because the live bot's symbol universe is discovered dynamically (see
+fetch_tradable_symbols()/select_top_1hz() in the bot) and isn't fully
+known even at training time.
 """
 import math
 from typing import List, Optional, Sequence, Tuple
@@ -160,6 +158,31 @@ def normalize_duration_count(n_units: float, kind: str) -> float:
     cap = DURATION_LOG_NORM_CAP_TICKS if kind == "tick" else DURATION_LOG_NORM_CAP_MINUTES
     n = max(float(n_units), 0.0)
     return float(math.log1p(n) / math.log1p(cap))
+
+
+def local_normalize(x: torch.Tensor) -> torch.Tensor:
+    """Per-window z-score, computed independently for every example from
+    its OWN window -- deliberately NOT a global scalar fit once at train
+    time and baked into the model. The live bot trades a DYNAMIC,
+    data-driven basket of volatility-index symbols discovered fresh at
+    every deep calibration (see fetch_tradable_symbols()/select_top_1hz()
+    in risefall_bot_v4_hmm_gbm.py); the exact set isn't fully known even
+    at training time, and different symbols in that family have very
+    different native volatility scales (a Volatility 100 index's returns
+    are roughly 10x the magnitude of a Volatility 10 index's). A single
+    baked-in mean/std calibrated to whichever symbols happened to be in
+    the training pool would systematically mis-scale any symbol whose
+    volatility differs from that pool. Local, per-window normalization
+    makes every window ~N(0,1) regardless of which symbol or scale
+    produced it -- genuinely scale-invariant, and it generalizes
+    correctly even to a symbol the trainer never saw.
+
+    x: (batch, seq_len, 1). risefall_lstm_train.py's diagnostic GRU/CNN
+    competitors call this too, so the baseline comparison isn't confounded
+    by the served model getting a normalization advantage they didn't."""
+    mean = x.mean(dim=1, keepdim=True)
+    std = x.std(dim=1, keepdim=True).clamp_min(1e-8)
+    return (x - mean) / std
 
 
 # =============================================================================
@@ -272,15 +295,6 @@ class RiseFallWinClassifier(nn.Module):
         self.n_heads = n_heads
 
         self.encoder = RiseFallEncoder(window_size, hidden_size, num_layers)
-        # Return-normalization stats, set ONCE by risefall_lstm_train.py
-        # (via set_normalization_stats(), computed from TRAINING-SPLIT data
-        # only -- see that file's train_model()) and then persisted as part
-        # of state_dict like any other buffer. This is what guarantees the
-        # live bot's compute_hidden() always applies the exact same
-        # normalization the model was trained under -- there's no separate
-        # scaler object to keep in sync or forget to ship.
-        self.register_buffer("return_mean", torch.zeros(1))
-        self.register_buffer("return_std", torch.ones(1))
         # +1 input: normalized duration. No barrier_sigma -- RISEFALL has no
         # barrier, direction alone is the whole question.
         self.heads = nn.ModuleList([
@@ -292,23 +306,8 @@ class RiseFallWinClassifier(nn.Module):
             ) for _ in range(n_heads)
         ])
 
-    def set_normalization_stats(self, mean: float, std: float):
-        """Called once by the trainer, right after construction and before
-        the first training step, with mean/std computed from the TRAINING
-        split's returns only (never validation, never the full series --
-        see risefall_lstm_train.train_model()). Safe to call again on an
-        already-trained model (e.g. if re-fit), but doing so after training
-        without re-training invalidates the learned weights' calibration."""
-        std = float(std) if std is not None and std > 1e-9 else 1.0
-        with torch.no_grad():
-            self.return_mean.fill_(float(mean))
-            self.return_std.fill_(std)
-
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.return_mean) / self.return_std
-
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(self._normalize(x))
+        return self.encoder(local_normalize(x))
 
     def forward(self, x: torch.Tensor, duration_norm: torch.Tensor) -> torch.Tensor:
         """x: (batch, window_size, 1); duration_norm: (batch, 1) already

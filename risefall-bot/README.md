@@ -114,21 +114,36 @@ CREATE TABLE IF NOT EXISTS bot_risefall_lstm_model (
 
 ## What Gate 6 (the LSTM ensemble) actually changes
 
-- It's a **second opinion**, not a hard requirement — same treatment as
-  Gate 5's HMM/GBM Monte Carlo. It only vetoes a trade when the layer
-  stack's own signal is borderline (close to its qualifying threshold)
-  AND the LSTM ensemble disagrees on direction. Strong signals fire
-  regardless; the LSTM's read is logged as diagnostic-only.
+- Gate 6 is a **hard veto**, not a diagnostic — different from Gate 5's
+  HMM/GBM Monte Carlo, which only vetoes borderline signals. If the LSTM
+  ensemble disagrees with the layer stack's direction, the trade is
+  skipped, on every signal, not just weak ones. This is deliberate: the
+  LSTM is the model `risefall-trainer` actually optimizes and re-uploads
+  every cron cycle (unlike its five comparison baselines — persistence,
+  AR(1)/Hurst, a GBM, a GRU, a dilated CNN — which stay diagnostic-only
+  and never influence a live trade), so it gets real veto power to match.
+  **Practical consequence**: this can meaningfully cut trade frequency,
+  and the quality of your trades now depends on the LSTM actually being
+  good, not just present. Consider leaving `LSTM_ENABLED=false` until
+  `risefall-trainer`'s `baseline_comparison` logs show the LSTM reliably
+  beating its persistence baseline (and ideally the richer AR(1)/GBM/GRU/
+  CNN ones too) over a few cron cycles, then flip it on.
 - When the **minute-bar** model (not the tick model) produces the most
   confident read in a given cycle — low ensemble disagreement, meaningful
-  edge, direction agreeing with the layer stack — the bot will attempt a
-  minute-duration Rise/Fall contract instead of its usual tick contract.
-  If Deriv doesn't support minute-duration contracts for that particular
-  symbol, the buy attempt fails and the bot immediately retries the same
-  trade as a tick contract in the same cycle — no trade is ever dropped
-  because of this.
+  edge, direction already agreeing with the layer stack (Gate 6 already
+  vetoed any disagreement above) — the bot will attempt a minute-duration
+  Rise/Fall contract instead of its usual tick contract. If Deriv doesn't
+  support minute-duration contracts for that particular symbol, the buy
+  attempt fails and the bot immediately retries the same trade as a tick
+  contract in the same cycle — no trade is ever dropped because of this.
 - Until the trainer has completed at least one successful run of each
-  `MODEL_KIND`, both models are simply absent and Gate 6 is a no-op.
+  `MODEL_KIND`, both models are simply absent and Gate 6 is a no-op (same
+  as `LSTM_ENABLED=false`) — it never blocks trades it has no opinion on.
+- The trainer now trains **one shared model pooled across a whole basket
+  of symbols** (see its README), not just `1HZ10V` — normalization is
+  per-window/local (`local_normalize()` in `risefall_lstm_model.py`), so
+  the same model applies sanely to any symbol regardless of that symbol's
+  native volatility scale, including ones outside the trainer's basket.
 
 ## Safety notes
 

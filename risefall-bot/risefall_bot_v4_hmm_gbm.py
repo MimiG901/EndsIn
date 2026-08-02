@@ -502,10 +502,17 @@ PORTFOLIO_HIGH_CORR        = 0.40   # above this → correlation penalty applies
 
 # ── v7: RISEFALL LSTM ensemble (Gate 6) ────────────────────────────────────
 # Two independently-trained deep-ensemble models (risefall_lstm_train.py,
-# MODEL_KIND=tick / MODEL_KIND=minute), loaded here from Supabase and
-# treated as a SECOND independent second-opinion, same confidence-gated
-# agreement pattern as Gate 5's hmm_gbm_scan() (see MC_BORDERLINE_MULTIPLIER
-# above) -- not a hard veto on every trade, only on borderline ones.
+# MODEL_KIND=tick / MODEL_KIND=minute), loaded here from Supabase. Unlike
+# Gate 5's hmm_gbm_scan() (confidence-gated -- only vetoes borderline
+# signals), Gate 6 is a HARD veto: any trade this bot is about to place
+# gets skipped if the LSTM ensemble disagrees on direction, full stop, not
+# just on borderline ones. This model IS what the trainer optimizes and
+# uploads every cron cycle -- it's the served signal, not a diagnostic --
+# so it gets real, unconditional veto power. (The five comparison
+# baselines run_baseline_diagnostics() fits in risefall_lstm_train.py --
+# persistence, AR(1)/Hurst, GBM, a GRU, a dilated CNN -- are the ones that
+# stay diagnostic-only; they exist purely to sanity-check that THIS model
+# is worth serving, and never touch a live trade themselves.)
 #
 # The minute-bar model additionally gets a real execution path: when it
 # (not the tick model) wins lstm_duration_scan()'s internal sweep with a
@@ -4726,27 +4733,25 @@ async def main():
                       f"{'CALL' if rec_dir>0 else 'PUT'} -- trading on the layer "
                       f"stack's pick regardless.")
 
-            # Gate 6 (v7): RISEFALL LSTM ensemble -- same confidence-gated
-            # agreement pattern as Gate 5 above, plus an optional minute-
-            # duration override when the minute-bar model wins the sweep
-            # with a confident edge. See LSTM_* constants and lstm_evaluate().
+            # Gate 6 (v7): RISEFALL LSTM ensemble. Unlike Gate 5, this is a
+            # HARD veto on direction disagreement whenever the ensemble has
+            # enough data to produce an opinion -- not confidence-gated to
+            # borderline signals only. This is the model the trainer
+            # actually optimizes and ships to Supabase every cron cycle
+            # (unlike the five comparison baselines in
+            # run_baseline_diagnostics(), which are diagnostic-only and
+            # never influence a live trade); it earns real veto power
+            # accordingly, on every signal, not just weak ones.
             rec_exec_duration, rec_exec_unit = duration, "t"
             lstm_best = lstm_evaluate(sd)
             if lstm_best is not None:
                 if lstm_best["direction"] != rec_dir:
-                    if rec_borderline:
-                        print(f"[LSTM/Recovery] {rec_sym}: BORDERLINE signal and LSTM "
-                              f"ensemble disagrees -- leans "
-                              f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
-                              f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) "
-                              f"vs layer stack's {'CALL' if rec_dir>0 else 'PUT'} -- "
-                              f"waiting instead of trading through the disagreement.")
-                        continue
-                    print(f"[LSTM/Recovery] {rec_sym}: ensemble leans "
+                    print(f"[LSTM/Recovery] {rec_sym} skipped -- ensemble leans "
                           f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
-                          f"(p={lstm_best['p']:.3f}, signal strong -- diagnostic only) "
-                          f"vs layer stack's {'CALL' if rec_dir>0 else 'PUT'} -- "
-                          f"trading on the layer stack's pick regardless.")
+                          f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) vs "
+                          f"layer stack's {'CALL' if rec_dir>0 else 'PUT'} -- Gate 6 is a "
+                          f"hard veto, waiting instead of trading through the disagreement.")
+                    continue
                 elif (lstm_best["duration_unit"] == "m"
                       and lstm_best["edge"] >= LSTM_MIN_EDGE_FOR_MINUTE):
                     rec_exec_duration, rec_exec_unit = lstm_best["duration"], "m"
@@ -4938,25 +4943,23 @@ async def main():
                       f"{'CALL' if direction>0 else 'PUT'} -- proceeding on the layer "
                       f"stack's pick regardless.")
 
-            # Gate 6 (v7): RISEFALL LSTM ensemble -- same confidence-gated
-            # agreement pattern as Gate 5 above, plus an optional minute-
-            # duration override when the minute-bar model wins the sweep
-            # with a confident edge. See LSTM_* constants and lstm_evaluate().
+            # Gate 6 (v7): RISEFALL LSTM ensemble. Unlike Gate 5, this is a
+            # HARD veto on direction disagreement whenever the ensemble has
+            # enough data to produce an opinion -- not confidence-gated to
+            # borderline signals only. This is the model the trainer
+            # actually optimizes and ships to Supabase every cron cycle
+            # (unlike the five comparison baselines in
+            # run_baseline_diagnostics(), which are diagnostic-only and
+            # never influence a live trade); it earns real veto power
+            # accordingly, on every signal, not just weak ones.
             lstm_best = lstm_evaluate(sd)
             if lstm_best is not None:
                 if lstm_best["direction"] != direction:
-                    if sym_borderline:
-                        print(f"[LSTM] {s} skipped — BORDERLINE signal and LSTM "
-                              f"ensemble disagrees -- leans "
-                              f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
-                              f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) "
-                              f"vs layer stack's {'CALL' if direction>0 else 'PUT'}")
-                        continue
-                    print(f"[LSTM] {s}: ensemble leans "
+                    print(f"[LSTM] {s} skipped -- ensemble leans "
                           f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
-                          f"(p={lstm_best['p']:.3f}, signal strong -- diagnostic only) "
-                          f"vs layer stack's {'CALL' if direction>0 else 'PUT'} -- "
-                          f"proceeding on the layer stack's pick regardless.")
+                          f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) vs layer "
+                          f"stack's {'CALL' if direction>0 else 'PUT'} -- Gate 6 is a hard veto.")
+                    continue
                 elif (lstm_best["duration_unit"] == "m"
                       and lstm_best["edge"] >= LSTM_MIN_EDGE_FOR_MINUTE):
                     lstm_minute_overrides[s] = int(lstm_best["duration"])
