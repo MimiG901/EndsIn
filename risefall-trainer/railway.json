@@ -5,7 +5,7 @@
   },
   "deploy": {
     "startCommand": "python risefall_lstm_train.py",
-    "cronSchedule": "0 */2 * * *",
+    "cronSchedule": "0 */6 * * *",
     "restartPolicyType": "NEVER"
   }
 }
