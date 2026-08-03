@@ -3,7 +3,7 @@ Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
 ==========================================================
 Single-file bot. Scans all eligible synthetic-index symbols, runs an
 18-layer intelligence pipeline per symbol using fitted statistical models,
-fuses evidence via a meta-learner with Bayesian fallback, auto-selects trade
+fuses evidence via a meta-learner  with Bayesian fallback, auto-selects trade
 duration via Monte Carlo simulation, and allocates capital across symbols
 by edge × confidence × correlation adjustment.
 
