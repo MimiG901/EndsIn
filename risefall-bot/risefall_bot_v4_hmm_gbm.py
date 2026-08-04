@@ -357,23 +357,33 @@ MIN_SCORE_GAP = 0.05
 # v2 autotune-settled values (e.g. min_layer_agree pushed back to 11)
 # should not carry over. Bumping forces load_gates() to detect the version
 # mismatch, discard the stale rows, and use the new code defaults (9/4).
-GATE_SCHEMA_VERSION = 4
+#
+# FIX v4: bumped 4 → 5. The 9/4 default (and its 4/8 floor/ceiling) was
+# letting the gate loosen to as little as 25% layer-agreement, which is
+# not a real supermajority. Defaults raised to 11/4 with a locked 11/4
+# floor/ceiling (see GATE_ABS_FLOOR_AGREE / GATE_ABS_CEIL_DISAGREE below).
+# Bumping again so any 9/4-or-looser value already sitting in Supabase from
+# a previous deploy is discarded on restart rather than silently overriding
+# this fix.
+GATE_SCHEMA_VERSION = 5
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
-# FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
-# Of 150 rejected signals: 0 reached 11, but 26 hit exactly 10 and 31 hit
-# exactly 9 — the distribution clustered just below the bar, not far below
-# it. At 12/3 only 2 trade sequences completed in 3.7 hours, leaving almost
-# nothing for the new entropy/confluence/bootstrap gates to evaluate (they
-# rejected only 12 signals combined vs. 150 from this gate alone). Lowering
-# to 9/4 (56% supermajority, was 75%) should let ~38% of candidates through
-# to the new gates, which are now responsible for doing the real selection
-# work instead of mostly sitting idle downstream of an already-empty funnel.
-# NOTE: lowering this gate alone does not by itself raise trade quality —
-# it shifts more of the filtering burden onto entropy/confluence/bootstrap.
-# Watch their rejection rates after this change; if they stay near-idle while
-# win rate degrades, the new gates need tightening, not this one loosening further.
-MIN_LAYER_AGREE    = 9
+# FIX v3 (superseded by v4 below): Lowered 12/3 → 9/4 based on actual demo
+# log analysis (2026-06-30). Of 150 rejected signals: 0 reached 11, but 26
+# hit exactly 10 and 31 hit exactly 9 — the distribution clustered just
+# below the bar, not far below it. At 12/3 only 2 trade sequences completed
+# in 3.7 hours, leaving almost nothing for the new entropy/confluence/
+# bootstrap gates to evaluate. Lowering to 9/4 (56% supermajority, was 75%)
+# was meant to let ~38% of candidates through to those gates instead.
+#
+# FIX v4: Raised back to 11/4 (69% supermajority). 9/4 — combined with the
+# 4/8 floor/ceiling on the adaptive controller below — let the gate drift
+# down to as little as 4/16 layers agreeing (25%) during starvation/relax
+# cycles, which is not a meaningful consensus and let low-conviction,
+# noise-driven trades through. 11/4 is now also the FLOOR (see
+# GATE_ABS_FLOOR_AGREE / GATE_ABS_CEIL_DISAGREE) — the adaptive controller
+# can tighten further but can never loosen past this again.
+MIN_LAYER_AGREE    = 11
 MAX_LAYER_DISAGREE = 4
 
 # ── Adaptive gate controller (v5) ───────────────────────────────────────────
@@ -398,11 +408,21 @@ GATE_SCHEMA_VERSION_BUMP_NOTE = (
     "GATE_SCHEMA_VERSION bumped 3->4 below to force a clean reset of "
     "whatever value is currently stuck in bot_gate_config."
 )
-GATE_ABS_FLOOR_AGREE    = 4     # never recalibrate below this (safety: some
-                                 # minimum consensus must still be required)
+GATE_ABS_FLOOR_AGREE    = 11    # never recalibrate below this (safety: some
+                                 # minimum consensus must still be required —
+                                 # raised 4->11 because 4/16 layers agreeing
+                                 # (25%) let clearly low-conviction, noise-driven
+                                 # signals through both maybe_recalibrate_gate()'s
+                                 # starvation/percentile paths and autotune_gates()'
+                                 # relax branch)
 GATE_ABS_CEIL_AGREE     = 14    # never recalibrate above this
 GATE_ABS_FLOOR_DISAGREE = 1
-GATE_ABS_CEIL_DISAGREE  = 8
+GATE_ABS_CEIL_DISAGREE  = 4     # never recalibrate above this (was 8 — allowed
+                                 # up to half the layer stack to actively vote
+                                 # against a trade that still fired; capped at
+                                 # 4 to match MAX_LAYER_DISAGREE's own floor so
+                                 # loosening can no longer relax this dimension
+                                 # at all, only MIN_LAYER_AGREE)
 GATE_TARGET_PASS_RATE   = 0.12  # aim for ~12% of gate CHECKS (not trades) to
                                  # clear Gate 1 -- the knob to turn if you
                                  # want more/less trade frequency long-term
@@ -2287,9 +2307,27 @@ def compute_features(sd, models, returns_window_dict):
     ou                     = ou_reversion_signal(prices, models.ou_params)
 
     current_t  = float(sd.epochs()[-1] - models.origin_epoch)
-    lam_up     = hawkes_intensity_now(models.hawkes_up,   models.hawkes_up_events,   current_t)
-    lam_down   = hawkes_intensity_now(models.hawkes_down, models.hawkes_down_events, current_t)
-    hawkes_sig = (lam_up - lam_down) / (lam_up + lam_down + 1e-9)
+    # BUG FIX (CALL-bias source): hawkes_intensity_now() returns 0.0 whenever
+    # its side's model is None (fewer than 10 threshold-crossing events on
+    # that side during calibration -- see fit_symbol_hawkes/fit_hawkes). When
+    # only ONE side fits -- which up/down event counts do independently and
+    # asymmetrically, not as a fair contest -- the fitted side's intensity
+    # was being compared against a hard 0.0 instead of "unknown", so
+    # hawkes_sig collapsed to (approximately) +1 or -1 purely because the
+    # other side didn't reach the fitting minimum, not because of genuine
+    # directional evidence. This is a real source of a one-sided bias (CALL
+    # or PUT depending on which side happens to fit more often for a given
+    # symbol's tick behaviour) baked into a layer that then gets a vote in
+    # both passes_layer_gate() and bayesian_fusion(). Fix: only compare the
+    # two intensities when BOTH sides have a fitted model; otherwise this
+    # layer has no real opinion and should vote neutral (0.0), same as the
+    # existing "no model at all" case already does.
+    if models.hawkes_up is None or models.hawkes_down is None:
+        hawkes_sig = 0.0
+    else:
+        lam_up     = hawkes_intensity_now(models.hawkes_up,   models.hawkes_up_events,   current_t)
+        lam_down   = hawkes_intensity_now(models.hawkes_down, models.hawkes_down_events, current_t)
+        hawkes_sig = (lam_up - lam_down) / (lam_up + lam_down + 1e-9)
 
     h          = hurst_rs(prices)
     arfima     = arfima_bias(returns, h)
@@ -3119,14 +3157,14 @@ def autotune_gates(state):
             print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades < 0.46 → TIGHTENED: "
                   f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
     elif wr > 0.54 and total_trades >= 100:
-        # FIX v3: floor lowered 10→7, disagree ceiling raised 4→6.
-        # The previous floor of 10 meant autotune could never relax below
-        # the level that was already starving the bot of trades (confirmed:
-        # it settled at 11, one step above its own floor of 10). With the
-        # new 9/4 starting point and a real floor of 7/6, autotune now has
-        # genuine room to explore toward more trade flow if win rate stays
-        # healthy, rather than oscillating against a ceiling that was set
-        # before the new downstream gates existed to share the filtering load.
+        # FIX v4: floor/ceiling raised back to 11/4 (was 4/8). The 4/8 range
+        # let autotune (and maybe_recalibrate_gate's starvation/percentile
+        # paths) relax all the way down to 25% layer-agreement / half the
+        # stack actively disagreeing, which is loose enough for low-conviction,
+        # noise-driven signals to clear the gate purely to chase trade
+        # frequency. 11/4 keeps the RELAX branch able to explore toward more
+        # trade flow when win rate is healthy, but never below the supermajority
+        # (11/16 ≈ 69%) that the gate's own design intends.
         new_agree = max(MIN_LAYER_AGREE - 1, GATE_ABS_FLOOR_AGREE)
         new_dis   = min(MAX_LAYER_DISAGREE + 1, GATE_ABS_CEIL_DISAGREE)
         new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
