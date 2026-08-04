@@ -179,13 +179,21 @@ CREATE INDEX IF NOT EXISTS idx_risefall_minute_bars_symbol_epoch
   the same model applies sanely to any symbol regardless of that symbol's
   native volatility scale, including ones outside the trainer's basket.
 
-Note: the martingale recovery path (continuing an already-lost sequence
-on a specific symbol/direction) still only uses the tick-gate pipeline +
-Gate 6's veto/minute-override — it doesn't yet have the standalone-
-origination path, since "continue this specific losing sequence" is a
-different kind of decision than "originate a fresh trade" and it wasn't
-obviously right to let the LSTM redirect a recovery sequence onto a
-symbol/direction the martingale logic wasn't already committed to.
+- **v8: minute takes priority over tick, not just "whichever is rated
+  highest".** Both at the model level (`lstm_duration_scan()` in
+  `risefall_lstm_model.py` returns the minute model's best pick whenever
+  it produced anything usable, regardless of whether some tick pick had
+  a numerically higher edge) and at the candidate-selection level in the
+  bot (among whichever of the tick-gate and lstm-standalone candidates
+  qualified this cycle, any with `duration_unit=="m"` is preferred over
+  any with `"t"` outright — edge/rating only breaks ties among
+  same-duration-unit candidates). Tick is the fallback, used only when no
+  minute candidate is available or confident enough this cycle.
+- **This applies to the martingale recovery path too** (continuing an
+  already-lost sequence), not just fresh trade origination — the LSTM
+  ensemble is scanned across every ready symbol independently of the
+  tick-based recovery pick, and the same minute-priority / whichever-
+  rated-higher logic decides which one (and which symbol) actually fires.
 
 ## Safety notes
 

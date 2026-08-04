@@ -357,33 +357,23 @@ MIN_SCORE_GAP = 0.05
 # v2 autotune-settled values (e.g. min_layer_agree pushed back to 11)
 # should not carry over. Bumping forces load_gates() to detect the version
 # mismatch, discard the stale rows, and use the new code defaults (9/4).
-#
-# FIX v4: bumped 4 → 5. The 9/4 default (and its 4/8 floor/ceiling) was
-# letting the gate loosen to as little as 25% layer-agreement, which is
-# not a real supermajority. Defaults raised to 11/4 with a locked 11/4
-# floor/ceiling (see GATE_ABS_FLOOR_AGREE / GATE_ABS_CEIL_DISAGREE below).
-# Bumping again so any 9/4-or-looser value already sitting in Supabase from
-# a previous deploy is discarded on restart rather than silently overriding
-# this fix.
-GATE_SCHEMA_VERSION = 5
+GATE_SCHEMA_VERSION = 4
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
-# FIX v3 (superseded by v4 below): Lowered 12/3 → 9/4 based on actual demo
-# log analysis (2026-06-30). Of 150 rejected signals: 0 reached 11, but 26
-# hit exactly 10 and 31 hit exactly 9 — the distribution clustered just
-# below the bar, not far below it. At 12/3 only 2 trade sequences completed
-# in 3.7 hours, leaving almost nothing for the new entropy/confluence/
-# bootstrap gates to evaluate. Lowering to 9/4 (56% supermajority, was 75%)
-# was meant to let ~38% of candidates through to those gates instead.
-#
-# FIX v4: Raised back to 11/4 (69% supermajority). 9/4 — combined with the
-# 4/8 floor/ceiling on the adaptive controller below — let the gate drift
-# down to as little as 4/16 layers agreeing (25%) during starvation/relax
-# cycles, which is not a meaningful consensus and let low-conviction,
-# noise-driven trades through. 11/4 is now also the FLOOR (see
-# GATE_ABS_FLOOR_AGREE / GATE_ABS_CEIL_DISAGREE) — the adaptive controller
-# can tighten further but can never loosen past this again.
-MIN_LAYER_AGREE    = 11
+# FIX v3: Lowered 12/3 → 9/4 based on actual demo log analysis (2026-06-30).
+# Of 150 rejected signals: 0 reached 11, but 26 hit exactly 10 and 31 hit
+# exactly 9 — the distribution clustered just below the bar, not far below
+# it. At 12/3 only 2 trade sequences completed in 3.7 hours, leaving almost
+# nothing for the new entropy/confluence/bootstrap gates to evaluate (they
+# rejected only 12 signals combined vs. 150 from this gate alone). Lowering
+# to 9/4 (56% supermajority, was 75%) should let ~38% of candidates through
+# to the new gates, which are now responsible for doing the real selection
+# work instead of mostly sitting idle downstream of an already-empty funnel.
+# NOTE: lowering this gate alone does not by itself raise trade quality —
+# it shifts more of the filtering burden onto entropy/confluence/bootstrap.
+# Watch their rejection rates after this change; if they stay near-idle while
+# win rate degrades, the new gates need tightening, not this one loosening further.
+MIN_LAYER_AGREE    = 9
 MAX_LAYER_DISAGREE = 4
 
 # ── Adaptive gate controller (v5) ───────────────────────────────────────────
@@ -408,21 +398,11 @@ GATE_SCHEMA_VERSION_BUMP_NOTE = (
     "GATE_SCHEMA_VERSION bumped 3->4 below to force a clean reset of "
     "whatever value is currently stuck in bot_gate_config."
 )
-GATE_ABS_FLOOR_AGREE    = 11    # never recalibrate below this (safety: some
-                                 # minimum consensus must still be required —
-                                 # raised 4->11 because 4/16 layers agreeing
-                                 # (25%) let clearly low-conviction, noise-driven
-                                 # signals through both maybe_recalibrate_gate()'s
-                                 # starvation/percentile paths and autotune_gates()'
-                                 # relax branch)
+GATE_ABS_FLOOR_AGREE    = 4     # never recalibrate below this (safety: some
+                                 # minimum consensus must still be required)
 GATE_ABS_CEIL_AGREE     = 14    # never recalibrate above this
 GATE_ABS_FLOOR_DISAGREE = 1
-GATE_ABS_CEIL_DISAGREE  = 4     # never recalibrate above this (was 8 — allowed
-                                 # up to half the layer stack to actively vote
-                                 # against a trade that still fired; capped at
-                                 # 4 to match MAX_LAYER_DISAGREE's own floor so
-                                 # loosening can no longer relax this dimension
-                                 # at all, only MIN_LAYER_AGREE)
+GATE_ABS_CEIL_DISAGREE  = 8
 GATE_TARGET_PASS_RATE   = 0.12  # aim for ~12% of gate CHECKS (not trades) to
                                  # clear Gate 1 -- the knob to turn if you
                                  # want more/less trade frequency long-term
@@ -2307,27 +2287,9 @@ def compute_features(sd, models, returns_window_dict):
     ou                     = ou_reversion_signal(prices, models.ou_params)
 
     current_t  = float(sd.epochs()[-1] - models.origin_epoch)
-    # BUG FIX (CALL-bias source): hawkes_intensity_now() returns 0.0 whenever
-    # its side's model is None (fewer than 10 threshold-crossing events on
-    # that side during calibration -- see fit_symbol_hawkes/fit_hawkes). When
-    # only ONE side fits -- which up/down event counts do independently and
-    # asymmetrically, not as a fair contest -- the fitted side's intensity
-    # was being compared against a hard 0.0 instead of "unknown", so
-    # hawkes_sig collapsed to (approximately) +1 or -1 purely because the
-    # other side didn't reach the fitting minimum, not because of genuine
-    # directional evidence. This is a real source of a one-sided bias (CALL
-    # or PUT depending on which side happens to fit more often for a given
-    # symbol's tick behaviour) baked into a layer that then gets a vote in
-    # both passes_layer_gate() and bayesian_fusion(). Fix: only compare the
-    # two intensities when BOTH sides have a fitted model; otherwise this
-    # layer has no real opinion and should vote neutral (0.0), same as the
-    # existing "no model at all" case already does.
-    if models.hawkes_up is None or models.hawkes_down is None:
-        hawkes_sig = 0.0
-    else:
-        lam_up     = hawkes_intensity_now(models.hawkes_up,   models.hawkes_up_events,   current_t)
-        lam_down   = hawkes_intensity_now(models.hawkes_down, models.hawkes_down_events, current_t)
-        hawkes_sig = (lam_up - lam_down) / (lam_up + lam_down + 1e-9)
+    lam_up     = hawkes_intensity_now(models.hawkes_up,   models.hawkes_up_events,   current_t)
+    lam_down   = hawkes_intensity_now(models.hawkes_down, models.hawkes_down_events, current_t)
+    hawkes_sig = (lam_up - lam_down) / (lam_up + lam_down + 1e-9)
 
     h          = hurst_rs(prices)
     arfima     = arfima_bias(returns, h)
@@ -3157,14 +3119,14 @@ def autotune_gates(state):
             print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades < 0.46 → TIGHTENED: "
                   f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
     elif wr > 0.54 and total_trades >= 100:
-        # FIX v4: floor/ceiling raised back to 11/4 (was 4/8). The 4/8 range
-        # let autotune (and maybe_recalibrate_gate's starvation/percentile
-        # paths) relax all the way down to 25% layer-agreement / half the
-        # stack actively disagreeing, which is loose enough for low-conviction,
-        # noise-driven signals to clear the gate purely to chase trade
-        # frequency. 11/4 keeps the RELAX branch able to explore toward more
-        # trade flow when win rate is healthy, but never below the supermajority
-        # (11/16 ≈ 69%) that the gate's own design intends.
+        # FIX v3: floor lowered 10→7, disagree ceiling raised 4→6.
+        # The previous floor of 10 meant autotune could never relax below
+        # the level that was already starving the bot of trades (confirmed:
+        # it settled at 11, one step above its own floor of 10). With the
+        # new 9/4 starting point and a real floor of 7/6, autotune now has
+        # genuine room to explore toward more trade flow if win rate stays
+        # healthy, rather than oscillating against a ceiling that was set
+        # before the new downstream gates existed to share the filtering load.
         new_agree = max(MIN_LAYER_AGREE - 1, GATE_ABS_FLOOR_AGREE)
         new_dis   = min(MAX_LAYER_DISAGREE + 1, GATE_ABS_CEIL_DISAGREE)
         new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
@@ -4731,113 +4693,197 @@ async def main():
                 p_up, confidence = fuse_signal(feats, state, s)   # v3: meta-learner path
                 rec_scores[s] = (p_up, confidence)
 
-            rec_pick = select_trade(
-                rec_scores, state.reliability,
-                state.adaptive_threshold,
-                state.per_symbol_threshold
-            )
-            if not rec_pick:
-                continue   # no symbol clears quality bar yet — keep waiting
+            def try_tick_recovery_candidate():
+                """Runs the full tick-based recovery pipeline (select_trade
+                across all ready symbols, then Gates 5/6/1 on that single
+                pick), exactly as before. Returns a qualified candidate
+                dict, or None if any step rejects it -- a rejection here
+                no longer ends the recovery attempt outright (v8): the
+                LSTM ensemble gets an independent shot at originating a
+                recovery trade on ANY ready symbol right below, and
+                "minute priority, then whichever is rated higher" decides
+                between them, same policy as the normal scan loop."""
+                rec_pick = select_trade(
+                    rec_scores, state.reliability,
+                    state.adaptive_threshold,
+                    state.per_symbol_threshold
+                )
+                if not rec_pick:
+                    return None
 
-            rec_sym, rec_dir, rec_p_up, rec_score = rec_pick
-            sd    = symbol_data[rec_sym]
-            rec_models = state.model_cache.get(rec_sym)
-            feats = compute_features(sd, rec_models, returns_window_dict)
+                rec_sym, rec_dir, rec_p_up, rec_score = rec_pick
+                sd_r    = symbol_data[rec_sym]
+                rec_models = state.model_cache.get(rec_sym)
+                feats_r = compute_features(sd_r, rec_models, returns_window_dict)
+                if feats_r is None:
+                    return None
 
-            duration, exp_win_rate = monte_carlo_duration(
-                sd.prices(), sd.returns(), rec_dir, feats, CANDIDATE_DURATIONS,
-                models=rec_models
-            )
-            if exp_win_rate < MIN_EXP_WIN_RATE:
+                duration_r, exp_win_rate_r = monte_carlo_duration(
+                    sd_r.prices(), sd_r.returns(), rec_dir, feats_r, CANDIDATE_DURATIONS,
+                    models=rec_models
+                )
+                if exp_win_rate_r < MIN_EXP_WIN_RATE:
+                    return None
+
+                mc = hmm_gbm_scan(sd_r.prices(), sd_r.returns(), CANDIDATE_DURATIONS,
+                                  hmm_model=getattr(rec_models, "hmm_model", None))
+                rec_thr = state.per_symbol_threshold.get(rec_sym, state.adaptive_threshold)
+                rec_borderline = rec_score < MC_BORDERLINE_MULTIPLIER * rec_thr
+                if mc["direction"] != rec_dir:
+                    if rec_borderline:
+                        print(f"[MC/Recovery] {rec_sym}: BORDERLINE signal "
+                              f"(score={rec_score:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
+                              f"threshold={rec_thr:.3f}) and advanced MC disagrees -- "
+                              f"leans {'CALL' if mc['direction']>0 else 'PUT'} "
+                              f"(p={mc['p']:.3f}) vs layer stack's "
+                              f"{'CALL' if rec_dir>0 else 'PUT'} -- waiting instead "
+                              f"of trading through the disagreement.")
+                        return None
+                    print(f"[MC/Recovery] {rec_sym}: advanced MC leans "
+                          f"{'CALL' if mc['direction']>0 else 'PUT'} "
+                          f"(p={mc['p']:.3f} dur={mc['duration']}, signal is strong -- "
+                          f"score={rec_score:.3f} >= {MC_BORDERLINE_MULTIPLIER}x threshold, "
+                          f"so this is diagnostic only) vs layer stack's "
+                          f"{'CALL' if rec_dir>0 else 'PUT'} -- trading on the layer "
+                          f"stack's pick regardless.")
+
+                # Gate 6 (v7): RISEFALL LSTM ensemble -- hard veto, same as
+                # the normal scan loop (see that gate's comment for why).
+                rec_exec_duration, rec_exec_unit = duration_r, "t"
+                lstm_best = lstm_evaluate(sd_r)
+                if lstm_best is not None:
+                    if lstm_best["direction"] != rec_dir:
+                        print(f"[LSTM/Recovery] {rec_sym} skipped -- ensemble leans "
+                              f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
+                              f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) vs "
+                              f"layer stack's {'CALL' if rec_dir>0 else 'PUT'} -- Gate 6 is a "
+                              f"hard veto, waiting instead of trading through the disagreement.")
+                        return None
+                    elif (lstm_best["duration_unit"] == "m"
+                          and lstm_best["edge"] >= LSTM_MIN_EDGE_FOR_MINUTE):
+                        rec_exec_duration, rec_exec_unit = lstm_best["duration"], "m"
+                        print(f"[LSTM/Recovery] {rec_sym}: minute-bar model prefers a "
+                              f"{rec_exec_duration}m contract (p={lstm_best['p']:.3f} "
+                              f"p_std={lstm_best['p_std']:.3f} edge={lstm_best['edge']:.3f}) "
+                              f"-- trading minute duration with tick fallback.")
+
+                # ── Atomic gate check immediately before execution ──────────
+                # Evaluated here (not just at top of iteration) to prevent the
+                # race where gate blocks on tick N but trade fires on tick N+1
+                # before a fresh gate check runs.
+                gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats_r, rec_dir)
+                record_gate_vote(state, n_agree, n_disagree, feats_r["n_layers"])
+                maybe_recalibrate_gate(state)
+                if not gate_ok:
+                    print(f"[Gate/Recovery] step={state.recovery_step} — best pick {rec_sym} "
+                          f"vote {n_agree}/{feats_r['n_layers']} agree, {n_disagree} disagree, "
+                          f"{n_neutral} neutral — waiting for stronger consensus")
+                    return None
+
+                return {
+                    "source": "tick_gates", "symbol": rec_sym, "direction": rec_dir,
+                    "p_up": float(rec_p_up), "confidence": float(rec_scores[rec_sym][1]),
+                    "exp_win_rate": float(exp_win_rate_r), "rating": abs(float(rec_p_up) - 0.5),
+                    "duration": duration_r,
+                    "exec_duration": rec_exec_duration, "duration_unit": rec_exec_unit,
+                    "feats": feats_r, "n_agree": n_agree,
+                }
+
+            def try_lstm_standalone_recovery():
+                """Scans every ready symbol's LSTM ensemble independently
+                of the tick pipeline above (no Gates 1-5 corroboration)
+                and returns the single best-by-edge candidate that clears
+                LSTM_MIN_EDGE_STANDALONE, or None. Same "use both,
+                whichever wins" idea as the normal scan loop's
+                lstm_standalone path, adapted to recovery's "one best pick
+                across every ready symbol" shape (select_trade()'s
+                pattern) rather than a per-symbol loop."""
+                best_sym, best_cand = None, None
+                for s in ready_symbols:
+                    cand = lstm_evaluate(symbol_data[s])
+                    if cand is None or cand["edge"] < LSTM_MIN_EDGE_STANDALONE:
+                        continue
+                    if best_cand is None or cand["edge"] > best_cand["edge"]:
+                        best_sym, best_cand = s, cand
+                if best_cand is None:
+                    return None
+                feats_l = compute_features(symbol_data[best_sym], state.model_cache.get(best_sym),
+                                           returns_window_dict)
+                return {
+                    "source": "lstm_standalone", "symbol": best_sym,
+                    "direction": best_cand["direction"], "p_up": best_cand["p"],
+                    "confidence": min(1.0, best_cand["edge"] * 2.0),
+                    "exp_win_rate": best_cand["p"], "rating": best_cand["edge"],
+                    "duration": best_cand["duration"],
+                    "exec_duration": best_cand["duration"], "duration_unit": best_cand["duration_unit"],
+                    "feats": feats_l, "n_agree": None,
+                }
+
+            tick_candidate = try_tick_recovery_candidate()
+            lstm_candidate = try_lstm_standalone_recovery()
+
+            # v8: MINUTE TAKES PRIORITY OVER TICK, then whichever is rated
+            # higher -- identical policy to the normal scan loop above.
+            available = [c for c in (tick_candidate, lstm_candidate) if c is not None]
+            if not available:
                 continue
+            minute_available = [c for c in available if c["duration_unit"] == "m"]
+            pool = minute_available if minute_available else available
+            chosen = max(pool, key=lambda c: c["rating"])
 
-            # v6: confidence-gated advanced-MC agreement (see constant
-            # comment above). Borderline signals (score close to their
-            # qualifying threshold) require hmm_gbm_scan() to agree on
-            # direction before trading; signals that clear their threshold
-            # by a wide margin fire regardless -- a coin-flip-ish MC read
-            # has nothing useful to add to an already-strong signal, and
-            # requiring it there was the v4 mistake (see v5 note in header).
-            mc = hmm_gbm_scan(sd.prices(), sd.returns(), CANDIDATE_DURATIONS,
-                              hmm_model=getattr(rec_models, "hmm_model", None))
-            rec_thr = state.per_symbol_threshold.get(rec_sym, state.adaptive_threshold)
-            rec_borderline = rec_score < MC_BORDERLINE_MULTIPLIER * rec_thr
-            if mc["direction"] != rec_dir:
-                if rec_borderline:
-                    print(f"[MC/Recovery] {rec_sym}: BORDERLINE signal "
-                          f"(score={rec_score:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
-                          f"threshold={rec_thr:.3f}) and advanced MC disagrees -- "
-                          f"leans {'CALL' if mc['direction']>0 else 'PUT'} "
-                          f"(p={mc['p']:.3f}) vs layer stack's "
-                          f"{'CALL' if rec_dir>0 else 'PUT'} -- waiting instead "
-                          f"of trading through the disagreement.")
-                    continue
-                print(f"[MC/Recovery] {rec_sym}: advanced MC leans "
-                      f"{'CALL' if mc['direction']>0 else 'PUT'} "
-                      f"(p={mc['p']:.3f} dur={mc['duration']}, signal is strong -- "
-                      f"score={rec_score:.3f} >= {MC_BORDERLINE_MULTIPLIER}x threshold, "
-                      f"so this is diagnostic only) vs layer stack's "
-                      f"{'CALL' if rec_dir>0 else 'PUT'} -- trading on the layer "
-                      f"stack's pick regardless.")
+            if len(available) > 1:
+                print(f"[Signal/Recovery] candidates this cycle -- " +
+                     ", ".join(f"{c['symbol']}/{c['source']}({c['duration_unit']}, "
+                              f"rating={c['rating']:.3f})" for c in available) +
+                     f" -- trading {chosen['symbol']}/{chosen['source']} "
+                     f"({'minute-priority' if minute_available else 'no minute candidate, tick fallback'}).")
+            elif chosen["source"] == "lstm_standalone":
+                print(f"[LSTM/Recovery]: tick-based recovery pipeline did not qualify this "
+                      f"cycle, but the LSTM ensemble independently likes {chosen['symbol']} "
+                      f"{'CALL' if chosen['direction']>0 else 'PUT'} (p={chosen['p_up']:.3f} "
+                      f"edge={chosen['rating']:.3f}) -- trading on that.")
 
-            # Gate 6 (v7): RISEFALL LSTM ensemble. Unlike Gate 5, this is a
-            # HARD veto on direction disagreement whenever the ensemble has
-            # enough data to produce an opinion -- not confidence-gated to
-            # borderline signals only. This is the model the trainer
-            # actually optimizes and ships to Supabase every cron cycle
-            # (unlike the five comparison baselines in
-            # run_baseline_diagnostics(), which are diagnostic-only and
-            # never influence a live trade); it earns real veto power
-            # accordingly, on every signal, not just weak ones.
-            rec_exec_duration, rec_exec_unit = duration, "t"
-            lstm_best = lstm_evaluate(sd)
-            if lstm_best is not None:
-                if lstm_best["direction"] != rec_dir:
-                    print(f"[LSTM/Recovery] {rec_sym} skipped -- ensemble leans "
-                          f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
-                          f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) vs "
-                          f"layer stack's {'CALL' if rec_dir>0 else 'PUT'} -- Gate 6 is a "
-                          f"hard veto, waiting instead of trading through the disagreement.")
-                    continue
-                elif (lstm_best["duration_unit"] == "m"
-                      and lstm_best["edge"] >= LSTM_MIN_EDGE_FOR_MINUTE):
-                    rec_exec_duration, rec_exec_unit = lstm_best["duration"], "m"
-                    print(f"[LSTM/Recovery] {rec_sym}: minute-bar model prefers a "
-                          f"{rec_exec_duration}m contract (p={lstm_best['p']:.3f} "
-                          f"p_std={lstm_best['p_std']:.3f} edge={lstm_best['edge']:.3f}) "
-                          f"-- trading minute duration with tick fallback.")
-
-            # ── Atomic gate check immediately before execution ──────────────
-            # Evaluated here (not just at top of iteration) to prevent the
-            # race where gate blocks on tick N but trade fires on tick N+1
-            # before a fresh gate check runs.
-            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, rec_dir)
-            record_gate_vote(state, n_agree, n_disagree, feats["n_layers"])
-            maybe_recalibrate_gate(state)
-            if not gate_ok:
-                print(f"[Gate/Recovery] step={state.recovery_step} — best pick {rec_sym} "
-                      f"vote {n_agree}/{feats['n_layers']} agree, {n_disagree} disagree, "
-                      f"{n_neutral} neutral — waiting for stronger consensus")
-                continue
+            rec_sym   = chosen["symbol"]
+            rec_dir   = chosen["direction"]
+            duration  = chosen["duration"]
+            feats     = chosen["feats"]
+            rec_exec_duration, rec_exec_unit = chosen["exec_duration"], chosen["duration_unit"]
+            recovery_source = chosen["source"]
+            n_agree = chosen["n_agree"] if chosen["n_agree"] is not None else "n/a"
 
             print(f"[Recovery] step={state.recovery_step} stake={state.recovery_stake:.2f} "
                   f"— best signal: {rec_sym} {'CALL' if rec_dir>0 else 'PUT'} "
-                  f"({n_agree}/16 agree, MC={exp_win_rate:.2f})")
+                  f"({n_agree}/16 agree, exp_win={chosen['exp_win_rate']:.2f}, "
+                  f"source={recovery_source})")
 
             explain_signal(
                 symbol=rec_sym, direction=rec_dir,
-                feats=feats, p_up=rec_p_up, confidence=rec_scores[rec_sym][1],
-                duration=duration, exp_win=exp_win_rate, score=rec_score
+                feats=feats, p_up=chosen["p_up"], confidence=chosen["confidence"],
+                duration=duration, exp_win=chosen["exp_win_rate"], score=chosen["rating"]
             )
 
-            # Final atomic gate re-check inside execute_single_step is the
-            # last line of defence — passes feats and direction through.
+            # v8: ATOMIC final recheck immediately before firing -- which
+            # one applies depends on which pipeline actually originated
+            # this trade, same reasoning as the normal scan loop's
+            # execution block. execute_single_step()'s own feats-based
+            # recheck below only applies to a tick_gates candidate.
+            if recovery_source == "lstm_standalone":
+                recheck = lstm_evaluate(symbol_data[rec_sym])
+                if (recheck is None or recheck["direction"] != rec_dir
+                        or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
+                    print(f"[LSTM/Recovery/Atomic] {rec_sym} blocked at execution -- "
+                          f"ensemble's read moved between scan and fire.")
+                    continue
+                atomic_feats = None
+            else:
+                atomic_feats = feats
+
             won, _ = await execute_single_step(
                 client, state, rec_sym, rec_dir,
                 state.recovery_stake, state.recovery_step,
                 duration=rec_exec_duration, duration_unit=rec_exec_unit,
                 fallback_duration=duration, fallback_duration_unit="t",
-                feats=feats
+                feats=atomic_feats
             )
 
             if won:
@@ -5084,26 +5130,35 @@ async def main():
                     "duration_unit": lstm_standalone["duration_unit"],
                 }
 
-            # "Whichever is rated most" -- both ratings are |p-0.5|, so
-            # they're directly comparable regardless of which pipeline
-            # produced them.
-            if tick_candidate and lstm_candidate:
-                chosen = (tick_candidate if tick_candidate["rating"] >= lstm_candidate["rating"]
-                         else lstm_candidate)
-                print(f"[Signal] {s}: both the tick-gate pipeline (rating="
-                      f"{tick_candidate['rating']:.3f}) and the standalone LSTM "
-                      f"(rating={lstm_candidate['rating']:.3f}) qualified -- trading the "
-                      f"{chosen['source']} pick.")
-            elif tick_candidate:
-                chosen = tick_candidate
-            elif lstm_candidate:
-                chosen = lstm_candidate
+            # v8: MINUTE TAKES PRIORITY OVER TICK -- not a pure "whichever
+            # is rated highest" comparison. Among whichever candidates
+            # qualified this cycle, prefer any with duration_unit=="m"
+            # over any with "t", regardless of relative edge; only among
+            # candidates that tie on duration_unit does rating (edge)
+            # break the tie. This mirrors lstm_duration_scan()'s own
+            # minute-over-tick policy (risefall_lstm_model.py) at this
+            # higher level too, since tick_candidate can ALSO carry a
+            # duration_unit=="m" (Gate 6's minute override inside
+            # try_tick_candidate) and needs to be weighed the same way
+            # against an lstm_standalone minute pick.
+            available = [c for c in (tick_candidate, lstm_candidate) if c is not None]
+            if not available:
+                continue
+            minute_available = [c for c in available if c["duration_unit"] == "m"]
+            pool = minute_available if minute_available else available
+            chosen = max(pool, key=lambda c: c["rating"])
+
+            if len(available) > 1:
+                print(f"[Signal] {s}: candidates this cycle -- " +
+                     ", ".join(f"{c['source']}({c['duration_unit']}, rating={c['rating']:.3f})"
+                              for c in available) +
+                     f" -- trading {chosen['source']} "
+                     f"({'minute-priority' if minute_available else 'no minute candidate, tick fallback'}).")
+            elif chosen["source"] == "lstm_standalone":
                 print(f"[LSTM] {s}: tick-gate pipeline did not qualify this cycle, but the "
                       f"LSTM ensemble independently likes "
                       f"{'CALL' if chosen['direction']>0 else 'PUT'} "
                       f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading on that.")
-            else:
-                continue
 
             direction = chosen["direction"]
             duration = chosen["duration"]

@@ -382,8 +382,19 @@ def lstm_duration_scan(tick_model: Optional["RiseFallWinClassifier"],
                        max_uncertainty: float = 0.18) -> dict:
     """
     Sweeps both duration units through their respective models and returns
-    the single best (direction, duration, duration_unit) pair by edge,
-    same return shape as hmm_gbm_scan() plus `duration_unit` and `p_std`.
+    the best (direction, duration, duration_unit) pick, same return shape
+    as hmm_gbm_scan() plus `duration_unit` and `p_std`.
+
+    MINUTE TAKES PRIORITY OVER TICK -- not a pure edge comparison. If the
+    minute model produced ANY candidate that clears max_uncertainty, that
+    candidate (the best-by-edge among minute candidates specifically) is
+    returned, regardless of whether some tick candidate happened to have
+    a numerically higher edge. Tick is only used as a fallback when the
+    minute model produced nothing usable this cycle (model not loaded
+    yet, minute_returns_window too short, or every minute candidate
+    exceeded the uncertainty cap). This is a deliberate policy, not an
+    accident of implementation -- minute-duration RISEFALL contracts are
+    the priority target, ticks are the fallback.
 
     max_uncertainty: candidates whose ensemble p_std exceeds this are
     dropped from consideration entirely before picking the best edge --
@@ -400,10 +411,9 @@ def lstm_duration_scan(tick_model: Optional["RiseFallWinClassifier"],
     minute_durations = minute_durations or CANDIDATE_DURATIONS_MINUTES
 
     grid = {}
-    best = None
+    best_by_unit = {"t": None, "m": None}
 
     def _consider(model, window, durations, unit):
-        nonlocal best
         if model is None or window is None or len(window) < 5:
             return
         hidden = model.compute_hidden(window)
@@ -414,13 +424,19 @@ def lstm_duration_scan(tick_model: Optional["RiseFallWinClassifier"],
                 continue
             for direction, p_dir in ((1, float(p)), (-1, 1.0 - float(p))):
                 edge = abs(p_dir - 0.5)
-                if best is None or edge > best["edge"]:
-                    best = {"direction": direction, "duration": int(dur),
-                            "duration_unit": unit, "p": p_dir,
-                            "p_std": float(s), "edge": edge}
+                current = best_by_unit[unit]
+                if current is None or edge > current["edge"]:
+                    best_by_unit[unit] = {"direction": direction, "duration": int(dur),
+                                          "duration_unit": unit, "p": p_dir,
+                                          "p_std": float(s), "edge": edge}
 
     _consider(tick_model, tick_returns_window, tick_durations, "t")
     _consider(minute_model, minute_returns_window, minute_durations, "m")
+
+    # Minute priority: use it whenever it produced anything usable at all,
+    # regardless of relative edge vs. the tick pick. Only fall back to
+    # tick when minute has nothing.
+    best = best_by_unit["m"] if best_by_unit["m"] is not None else best_by_unit["t"]
 
     if best is not None:
         best["grid"] = grid
