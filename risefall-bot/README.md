@@ -143,6 +143,24 @@ CREATE INDEX IF NOT EXISTS idx_risefall_minute_bars_symbol_epoch
   `risefall-trainer`'s `baseline_comparison` logs show the LSTM reliably
   beating its persistence baseline (and ideally the richer AR(1)/GBM/GRU/
   CNN ones too) over a few cron cycles, then flip it on.
+- **v8: the LSTM ensemble can now originate a trade entirely on its own**
+  (`LSTM_MIN_EDGE_STANDALONE`, default 0.12 -- a higher confidence bar
+  than the minute-override threshold below, since a standalone LSTM trade
+  has none of Gates 1-5's tick-based corroboration behind it). Previously
+  a trained minute model could only ever ride along on top of an already-
+  qualified tick trade, as a duration swap -- if the tick-based layer
+  stack (Gates 1-5) didn't qualify a symbol that cycle, the minute
+  model's opinion never got a chance to matter, no matter how confident
+  it was. Now both pipelines run independently every cycle, and
+  **whichever is rated higher wins** -- rating is `|p-0.5|` (edge) for
+  both, since that's directly comparable regardless of which one produced
+  it. Watch for `[Signal]`/`[LSTM]` log lines showing which pipeline's
+  pick actually got traded. The atomic final recheck immediately before
+  firing also branches correctly by source: a `tick_gates` trade still
+  gets Gate 1 re-verified right before execution (unchanged); an
+  `lstm_standalone` trade gets the ensemble itself re-verified instead
+  (re-checking Gate 1 on a trade Gate 1 was never part of would defeat
+  the whole point).
 - When the **minute-bar** model (not the tick model) produces the most
   confident read in a given cycle — low ensemble disagreement, meaningful
   edge, direction already agreeing with the layer stack (Gate 6 already
@@ -153,12 +171,21 @@ CREATE INDEX IF NOT EXISTS idx_risefall_minute_bars_symbol_epoch
   contract in the same cycle — no trade is ever dropped because of this.
 - Until the trainer has completed at least one successful run of each
   `MODEL_KIND`, both models are simply absent and Gate 6 is a no-op (same
-  as `LSTM_ENABLED=false`) — it never blocks trades it has no opinion on.
+  as `LSTM_ENABLED=false`) — it never blocks trades it has no opinion on,
+  and the standalone-origination path above simply never fires either.
 - The trainer now trains **one shared model pooled across a whole basket
   of symbols** (see its README), not just `1HZ10V` — normalization is
   per-window/local (`local_normalize()` in `risefall_lstm_model.py`), so
   the same model applies sanely to any symbol regardless of that symbol's
   native volatility scale, including ones outside the trainer's basket.
+
+Note: the martingale recovery path (continuing an already-lost sequence
+on a specific symbol/direction) still only uses the tick-gate pipeline +
+Gate 6's veto/minute-override — it doesn't yet have the standalone-
+origination path, since "continue this specific losing sequence" is a
+different kind of decision than "originate a fresh trade" and it wasn't
+obviously right to let the LSTM redirect a recovery sequence onto a
+symbol/direction the martingale logic wasn't already committed to.
 
 ## Safety notes
 

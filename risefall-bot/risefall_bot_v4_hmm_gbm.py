@@ -3,7 +3,7 @@ Deriv Multi-Symbol Rise/Fall Trading Bot - FULL POWER  v3
 ==========================================================
 Single-file bot. Scans all eligible synthetic-index symbols, runs an
 18-layer intelligence pipeline per symbol using fitted statistical models,
-fuses evidence via a meta-learner  with Bayesian fallback, auto-selects trade
+fuses evidence via a meta-learner with Bayesian fallback, auto-selects trade
 duration via Monte Carlo simulation, and allocates capital across symbols
 by edge × confidence × correlation adjustment.
 
@@ -531,6 +531,15 @@ LSTM_MAX_UNCERTAINTY     = float(os.getenv("LSTM_MAX_UNCERTAINTY", "0.18"))
 # above a coin flip on purpose -- this is an OPTIONAL upgrade over the
 # already-gated tick trade, not a requirement to trade at all.
 LSTM_MIN_EDGE_FOR_MINUTE = float(os.getenv("LSTM_MIN_EDGE_FOR_MINUTE", "0.08"))
+# v8: minimum edge for the LSTM ensemble to originate a trade ENTIRELY ON
+# ITS OWN, when the tick-gate pipeline (Gates 1-5) doesn't qualify a
+# candidate for a symbol this cycle. Deliberately higher than
+# LSTM_MIN_EDGE_FOR_MINUTE above -- that threshold only decides whether
+# to swap an ALREADY-qualified tick trade over to a minute contract; this
+# one decides whether to trade AT ALL with none of Gates 1-5's tick-based
+# corroboration behind it, so it should ask for more. See "whichever is
+# rated most" in the main scan loop below.
+LSTM_MIN_EDGE_STANDALONE = float(os.getenv("LSTM_MIN_EDGE_STANDALONE", "0.12"))
 # How often (seconds) to re-pull the latest state_dicts from Supabase.
 # Reload is piggy-backed onto run_calibration() (already periodic / event-
 # driven) rather than a separate timer, so it never races a trade in
@@ -4857,6 +4866,13 @@ async def main():
         # (PortfolioAllocator doesn't need to know about it) and looked up
         # again at execution time below.
         lstm_minute_overrides: Dict[str, int] = {}
+        # v8: which pipeline originated each symbol's chosen candidate --
+        # the execution loop below needs this to pick the right ATOMIC
+        # final recheck immediately before firing (tick-based Gate 1 for
+        # a tick_gates candidate; a fresh LSTM re-evaluation for an
+        # lstm_standalone one -- Gates 1-5 never applied to those, so
+        # re-checking Gate 1 on them would be checking the wrong thing).
+        candidate_source: Dict[str, str] = {}
 
         for s in ready_symbols:
             # Skip symbols already holding an open position
@@ -4877,100 +4893,190 @@ async def main():
             direction = 1 if p_up > 0.5 else -1
             s_models = state.model_cache.get(s)
 
-            # MC duration selection
-            duration, exp_win_rate = monte_carlo_duration(
+            # MC duration selection -- computed unconditionally now (used
+            # both inside the tick-gate pipeline below AND as the tick-
+            # duration fallback if an LSTM-standalone MINUTE trade gets
+            # picked instead and Deriv rejects duration_unit="m" for this
+            # symbol).
+            mc_duration, exp_win_rate = monte_carlo_duration(
                 sd.prices(), live_returns, direction, feats, CANDIDATE_DURATIONS,
                 models=s_models
             )
-            if exp_win_rate < MIN_EXP_WIN_RATE:
+
+            def try_tick_candidate():
+                """Runs the full tick-based layer-stack pipeline (Gates
+                1-6), exactly as before. Returns a qualified candidate
+                dict, or None if any gate rejects it -- a rejection here
+                no longer skips the symbol outright (v8): the LSTM
+                ensemble gets an independent shot at originating a trade
+                on this same symbol right below, and "whichever is rated
+                higher" wins. Defined as a closure so every existing gate
+                check/print below is untouched, just re-scoped to
+                `return None` instead of `continue`."""
+                if exp_win_rate < MIN_EXP_WIN_RATE:
+                    return None
+
+                # Gate 1: Layer agreement
+                gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, direction)
+                record_gate_vote(state, n_agree, n_disagree, feats["n_layers"])
+                maybe_recalibrate_gate(state)
+                if not gate_ok:
+                    print(f"[Gate] {s} skipped — layer vote {n_agree} agree / "
+                          f"{n_disagree} disagree / {n_neutral} neutral "
+                          f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
+                    return None
+
+                # Gate 2: Permutation entropy
+                pe_ok, pe_score = entropy_gate_passes(sd.prices())
+                if not pe_ok:
+                    print(f"[EntropyGate] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
+                    return None
+
+                # Gate 3: Multi-timeframe confluence
+                tf_agree, tf_dirs = multi_timeframe_confluence(sd.prices(), direction)
+                if tf_agree < MIN_TF_AGREEMENT:
+                    print(f"[Confluence] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
+                    return None
+
+                # Gate 4: Bootstrap meta-ensemble agreement
+                bs_agrees, bs_p = meta_ensemble_agrees(live_returns, direction, mc_duration, exp_win_rate)
+                if not bs_agrees:
+                    print(f"[MetaEnsemble] {s} skipped — bootstrap p={bs_p:.3f} vs "
+                          f"parametric p={exp_win_rate:.3f} disagree by >{BOOTSTRAP_AGREE_TOL}")
+                    return None
+
+                # Gate 5 (v6): confidence-gated advanced-MC agreement. Borderline
+                # signals (score close to their qualifying threshold) require
+                # hmm_gbm_scan() to agree on direction; signals clearing their
+                # threshold by a wide margin fire regardless -- see the
+                # MC_BORDERLINE_MULTIPLIER comment near the top of this file for
+                # why a coin-flip-ish MC read shouldn't veto an already-strong
+                # signal, and why v4's blanket hard-gate was the wrong call.
+                mc_scan = hmm_gbm_scan(sd.prices(), live_returns, CANDIDATE_DURATIONS,
+                                       hmm_model=getattr(s_models, "hmm_model", None))
+                sym_score = confidence * state.reliability.get(s, 1.0)
+                sym_thr   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
+                sym_borderline = sym_score < MC_BORDERLINE_MULTIPLIER * sym_thr
+                if mc_scan["direction"] != direction:
+                    if sym_borderline:
+                        print(f"[MC] {s} skipped — BORDERLINE signal "
+                              f"(score={sym_score:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
+                              f"threshold={sym_thr:.3f}) and advanced MC disagrees -- "
+                              f"leans {'CALL' if mc_scan['direction']>0 else 'PUT'} "
+                              f"(p={mc_scan['p']:.3f}) vs layer stack's "
+                              f"{'CALL' if direction>0 else 'PUT'}")
+                        return None
+                    print(f"[MC] {s}: advanced MC leans "
+                          f"{'CALL' if mc_scan['direction']>0 else 'PUT'} "
+                          f"(p={mc_scan['p']:.3f} dur={mc_scan['duration']}, signal is "
+                          f"strong -- score={sym_score:.3f} >= {MC_BORDERLINE_MULTIPLIER}x "
+                          f"threshold, so this is diagnostic only) vs layer stack's "
+                          f"{'CALL' if direction>0 else 'PUT'} -- proceeding on the layer "
+                          f"stack's pick regardless.")
+
+                # Gate 6 (v7): RISEFALL LSTM ensemble. Unlike Gate 5, this is a
+                # HARD veto on direction disagreement whenever the ensemble has
+                # enough data to produce an opinion -- not confidence-gated to
+                # borderline signals only. This is the model the trainer
+                # actually optimizes and ships to Supabase every cron cycle
+                # (unlike the five comparison baselines in
+                # run_baseline_diagnostics(), which are diagnostic-only and
+                # never influence a live trade); it earns real veto power
+                # accordingly, on every signal, not just weak ones.
+                lstm_best = lstm_evaluate(sd)
+                minute_override_duration = None
+                if lstm_best is not None:
+                    if lstm_best["direction"] != direction:
+                        print(f"[LSTM] {s} skipped -- ensemble leans "
+                              f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
+                              f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) vs layer "
+                              f"stack's {'CALL' if direction>0 else 'PUT'} -- Gate 6 is a hard veto.")
+                        return None
+                    elif (lstm_best["duration_unit"] == "m"
+                          and lstm_best["edge"] >= LSTM_MIN_EDGE_FOR_MINUTE):
+                        minute_override_duration = int(lstm_best["duration"])
+                        print(f"[LSTM] {s}: minute-bar model prefers a "
+                              f"{minute_override_duration}m contract (p={lstm_best['p']:.3f} "
+                              f"p_std={lstm_best['p_std']:.3f} edge={lstm_best['edge']:.3f}) "
+                              f"-- will trade minute duration with tick fallback.")
+
+                return {
+                    "source": "tick_gates",
+                    "direction": direction,
+                    "p_up": float(p_up),
+                    "confidence": float(confidence),
+                    "exp_win_rate": float(exp_win_rate),
+                    "rating": abs(float(p_up) - 0.5),
+                    "duration": mc_duration,
+                    "exec_duration": minute_override_duration if minute_override_duration else mc_duration,
+                    "duration_unit": "m" if minute_override_duration else "t",
+                }
+
+            tick_candidate = try_tick_candidate()
+
+            # v8: the LSTM ensemble ALSO gets an independent shot at
+            # originating a trade on this symbol, regardless of whether
+            # the tick-gate pipeline above qualified -- "use both,
+            # whichever is rated highest". Before this, a trained minute
+            # model could only ever ride along on top of an already-
+            # qualified tick trade (as a duration swap); now it can win
+            # outright on its own, using its OWN direction and duration,
+            # if it's confident enough and the tick pipeline either
+            # didn't qualify or qualified with a smaller edge. Held to a
+            # HIGHER bar (LSTM_MIN_EDGE_STANDALONE) than the minute-
+            # override threshold above, since a standalone LSTM trade has
+            # none of Gates 1-5's tick-based corroboration behind it.
+            lstm_standalone = lstm_evaluate(sd)
+            lstm_candidate = None
+            if lstm_standalone is not None and lstm_standalone["edge"] >= LSTM_MIN_EDGE_STANDALONE:
+                lstm_candidate = {
+                    "source": "lstm_standalone",
+                    "direction": lstm_standalone["direction"],
+                    "p_up": lstm_standalone["p"],
+                    # No tick-side "confidence"/"exp_win_rate" exists for a
+                    # standalone LSTM pick -- map edge (0..0.5) onto the
+                    # same rough 0..1 scale those normally occupy, since
+                    # both feed PortfolioAllocator's stake sizing and the
+                    # candidate sort order below.
+                    "confidence": min(1.0, lstm_standalone["edge"] * 2.0),
+                    "exp_win_rate": lstm_standalone["p"],
+                    "rating": lstm_standalone["edge"],
+                    "duration": lstm_standalone["duration"],
+                    "exec_duration": lstm_standalone["duration"],
+                    "duration_unit": lstm_standalone["duration_unit"],
+                }
+
+            # "Whichever is rated most" -- both ratings are |p-0.5|, so
+            # they're directly comparable regardless of which pipeline
+            # produced them.
+            if tick_candidate and lstm_candidate:
+                chosen = (tick_candidate if tick_candidate["rating"] >= lstm_candidate["rating"]
+                         else lstm_candidate)
+                print(f"[Signal] {s}: both the tick-gate pipeline (rating="
+                      f"{tick_candidate['rating']:.3f}) and the standalone LSTM "
+                      f"(rating={lstm_candidate['rating']:.3f}) qualified -- trading the "
+                      f"{chosen['source']} pick.")
+            elif tick_candidate:
+                chosen = tick_candidate
+            elif lstm_candidate:
+                chosen = lstm_candidate
+                print(f"[LSTM] {s}: tick-gate pipeline did not qualify this cycle, but the "
+                      f"LSTM ensemble independently likes "
+                      f"{'CALL' if chosen['direction']>0 else 'PUT'} "
+                      f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading on that.")
+            else:
                 continue
 
-            # Gate 1: Layer agreement
-            gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats, direction)
-            record_gate_vote(state, n_agree, n_disagree, feats["n_layers"])
-            maybe_recalibrate_gate(state)
-            if not gate_ok:
-                print(f"[Gate] {s} skipped — layer vote {n_agree} agree / "
-                      f"{n_disagree} disagree / {n_neutral} neutral "
-                      f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
-                continue
-
-            # Gate 2: Permutation entropy
-            pe_ok, pe_score = entropy_gate_passes(sd.prices())
-            if not pe_ok:
-                print(f"[EntropyGate] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
-                continue
-
-            # Gate 3: Multi-timeframe confluence
-            tf_agree, tf_dirs = multi_timeframe_confluence(sd.prices(), direction)
-            if tf_agree < MIN_TF_AGREEMENT:
-                print(f"[Confluence] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
-                continue
-
-            # Gate 4: Bootstrap meta-ensemble agreement
-            bs_agrees, bs_p = meta_ensemble_agrees(live_returns, direction, duration, exp_win_rate)
-            if not bs_agrees:
-                print(f"[MetaEnsemble] {s} skipped — bootstrap p={bs_p:.3f} vs "
-                      f"parametric p={exp_win_rate:.3f} disagree by >{BOOTSTRAP_AGREE_TOL}")
-                continue
-
-            # Gate 5 (v6): confidence-gated advanced-MC agreement. Borderline
-            # signals (score close to their qualifying threshold) require
-            # hmm_gbm_scan() to agree on direction; signals clearing their
-            # threshold by a wide margin fire regardless -- see the
-            # MC_BORDERLINE_MULTIPLIER comment near the top of this file for
-            # why a coin-flip-ish MC read shouldn't veto an already-strong
-            # signal, and why v4's blanket hard-gate was the wrong call.
-            mc_scan = hmm_gbm_scan(sd.prices(), live_returns, CANDIDATE_DURATIONS,
-                                   hmm_model=getattr(s_models, "hmm_model", None))
-            sym_score = confidence * state.reliability.get(s, 1.0)
-            sym_thr   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
-            sym_borderline = sym_score < MC_BORDERLINE_MULTIPLIER * sym_thr
-            if mc_scan["direction"] != direction:
-                if sym_borderline:
-                    print(f"[MC] {s} skipped — BORDERLINE signal "
-                          f"(score={sym_score:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
-                          f"threshold={sym_thr:.3f}) and advanced MC disagrees -- "
-                          f"leans {'CALL' if mc_scan['direction']>0 else 'PUT'} "
-                          f"(p={mc_scan['p']:.3f}) vs layer stack's "
-                          f"{'CALL' if direction>0 else 'PUT'}")
-                    continue
-                print(f"[MC] {s}: advanced MC leans "
-                      f"{'CALL' if mc_scan['direction']>0 else 'PUT'} "
-                      f"(p={mc_scan['p']:.3f} dur={mc_scan['duration']}, signal is "
-                      f"strong -- score={sym_score:.3f} >= {MC_BORDERLINE_MULTIPLIER}x "
-                      f"threshold, so this is diagnostic only) vs layer stack's "
-                      f"{'CALL' if direction>0 else 'PUT'} -- proceeding on the layer "
-                      f"stack's pick regardless.")
-
-            # Gate 6 (v7): RISEFALL LSTM ensemble. Unlike Gate 5, this is a
-            # HARD veto on direction disagreement whenever the ensemble has
-            # enough data to produce an opinion -- not confidence-gated to
-            # borderline signals only. This is the model the trainer
-            # actually optimizes and ships to Supabase every cron cycle
-            # (unlike the five comparison baselines in
-            # run_baseline_diagnostics(), which are diagnostic-only and
-            # never influence a live trade); it earns real veto power
-            # accordingly, on every signal, not just weak ones.
-            lstm_best = lstm_evaluate(sd)
-            if lstm_best is not None:
-                if lstm_best["direction"] != direction:
-                    print(f"[LSTM] {s} skipped -- ensemble leans "
-                          f"{'CALL' if lstm_best['direction']>0 else 'PUT'} "
-                          f"(p={lstm_best['p']:.3f} p_std={lstm_best['p_std']:.3f}) vs layer "
-                          f"stack's {'CALL' if direction>0 else 'PUT'} -- Gate 6 is a hard veto.")
-                    continue
-                elif (lstm_best["duration_unit"] == "m"
-                      and lstm_best["edge"] >= LSTM_MIN_EDGE_FOR_MINUTE):
-                    lstm_minute_overrides[s] = int(lstm_best["duration"])
-                    print(f"[LSTM] {s}: minute-bar model prefers a "
-                          f"{lstm_best['duration']}m contract (p={lstm_best['p']:.3f} "
-                          f"p_std={lstm_best['p_std']:.3f} edge={lstm_best['edge']:.3f}) "
-                          f"-- will trade minute duration with tick fallback.")
+            direction = chosen["direction"]
+            duration = chosen["duration"]
+            candidate_source[s] = chosen["source"]
+            if chosen["duration_unit"] == "m":
+                lstm_minute_overrides[s] = int(chosen["exec_duration"])
 
             # Passed all gates — add to portfolio candidates
             portfolio_candidates.append(
-                (s, direction, float(p_up), float(confidence), float(exp_win_rate), int(duration))
+                (s, direction, float(chosen["p_up"]), float(chosen["confidence"]),
+                 float(chosen["exp_win_rate"]), int(duration))
             )
 
         if not portfolio_candidates:
@@ -4992,10 +5098,32 @@ async def main():
 
         # Execute each allocation — fire trades simultaneously
         for symbol, direction, base_stake, duration in allocations:
-            sd    = symbol_data[symbol]
+            sd     = symbol_data[symbol]
+            source = candidate_source.get(symbol, "tick_gates")
             feats = compute_features(sd, state.model_cache.get(symbol), returns_window_dict)
             if feats is None:
                 continue
+
+            # v8: ATOMIC final recheck, immediately before firing --
+            # guards against the gate state having moved between the scan
+            # above and this execution loop. Which recheck applies
+            # depends on which pipeline actually originated this trade:
+            # Gates 1-5 never ran for an lstm_standalone candidate, so
+            # re-checking Gate 1 on it here would be re-checking a signal
+            # that was never part of the decision in the first place.
+            # execute_single_step()'s own atomic feats-based recheck below
+            # only applies to tick_gates candidates (feats=None skips it
+            # for lstm_standalone ones).
+            if source == "lstm_standalone":
+                recheck = lstm_evaluate(sd)
+                if (recheck is None or recheck["direction"] != direction
+                        or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
+                    print(f"[LSTM/Atomic] {symbol} blocked at execution -- ensemble's "
+                          f"read moved between scan and fire.")
+                    continue
+                atomic_feats = None
+            else:
+                atomic_feats = feats
 
             # Recover p_up and confidence for the selected symbol
             p_up_sym = next((c[2] for c in portfolio_candidates if c[0] == symbol), 0.5)
@@ -5030,7 +5158,7 @@ async def main():
                 client, state, symbol, direction, base_stake, 0,
                 duration=exec_duration, duration_unit=exec_unit,
                 fallback_duration=duration, fallback_duration_unit="t",
-                feats=feats
+                feats=atomic_feats
             )
 
             # Remove from open positions after resolution
