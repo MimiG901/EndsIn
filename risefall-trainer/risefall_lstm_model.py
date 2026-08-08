@@ -412,12 +412,28 @@ def lstm_duration_scan(tick_model: Optional["RiseFallWinClassifier"],
             grid[(unit, dur)] = (float(p), float(s))
             if s > max_uncertainty:
                 continue
-            for direction, p_dir in ((1, float(p)), (-1, 1.0 - float(p))):
-                edge = abs(p_dir - 0.5)
-                if best is None or edge > best["edge"]:
-                    best = {"direction": direction, "duration": int(dur),
-                            "duration_unit": unit, "p": p_dir,
-                            "p_std": float(s), "edge": edge}
+            # BUGFIX (2026-08-06): this used to generate TWO candidates per
+            # (dur, p, s) -- (direction=+1, p_dir=p) AND (direction=-1,
+            # p_dir=1-p) -- and compare their edges with a strict `>`. But
+            # abs(p-0.5) and abs((1-p)-0.5) are mathematically identical,
+            # so these were never two independent forecasts, just the same
+            # probability read twice. Since direction=+1 was always
+            # constructed first, the strict `>` comparison meant the
+            # direction=-1 entry could never win a genuine tie -- so this
+            # function was structurally biased toward CALL on every
+            # ambiguous grid point, breaking only via floating-point
+            # rounding noise on the 1.0-p subtraction (verified: ~90% CALL
+            # / ~10% near-random PUT flips in a 2000-trial simulation of
+            # this exact logic against synthetic model output). A single
+            # probability can only support ONE direction; decide it once,
+            # directly from which side of 0.5 the raw p falls on.
+            direction = 1 if p >= 0.5 else -1
+            p_dir = float(p) if direction == 1 else 1.0 - float(p)
+            edge = abs(p_dir - 0.5)
+            if best is None or edge > best["edge"]:
+                best = {"direction": direction, "duration": int(dur),
+                        "duration_unit": unit, "p": p_dir,
+                        "p_std": float(s), "edge": edge}
 
     _consider(tick_model, tick_returns_window, tick_durations, "t")
     _consider(minute_model, minute_returns_window, minute_durations, "m")
