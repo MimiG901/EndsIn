@@ -127,12 +127,99 @@ CREATE INDEX IF NOT EXISTS idx_risefall_minute_bars_symbol_epoch
    trades exactly as it did before the LSTM was wired in (`LSTM_ENABLED`
    can also be set to `false` to disable Gate 6 outright).
 
+## v9: the entire signal stack now runs on minutes, not just the LSTM
+
+Previously, only Gate 6 (the trained LSTM) actually understood minute-bar
+data — the ~16-18 layer intelligence stack (Markov, HMM regime, Hawkes,
+OU, Hurst, ARFIMA, Kalman, copula, vol_trust, entropy, etc., all feeding
+`bayesian_fusion`) and the Monte Carlo (`hmm_gbm_scan`,
+`monte_carlo_duration`) only ever computed on raw tick data. Even with
+"minute-first" candidate selection, whenever the LSTM didn't clear its
+own bar, the fallback pipeline that fired was 100% tick-native — there
+was no minute-scale version of it to fall back *into*.
+
+That's fixed now. `MinuteBarView` is a thin adapter that presents a
+symbol's resampled minute bars through the exact same interface
+`SymbolData` itself exposes (`.symbol`, `.prices()`, `.epochs()`,
+`.returns()`, `.mean_tick_dt()`). Every function in the tick-gate
+pipeline was audited (see conversation history) and confirmed to only
+touch its input data through that interface, or — for `entropy_gate_passes`,
+`multi_timeframe_confluence`, `hmm_gbm_scan`, `monte_carlo_duration`,
+`meta_ensemble_agrees` — to not take a `SymbolData`-like object at all,
+just plain `prices`/`returns` arrays. That means the entire existing,
+tested analytical stack runs unmodified against minute-bar data, just by
+feeding it through this adapter instead of ticks — no rewrite of the
+actual statistics.
+
+**New per-cycle priority order** (both the normal scan loop and the
+martingale recovery path):
+
+1. **`try_minute_gates_candidate()`** — the full Gates 1-6 + Monte Carlo
+   pipeline, running on minute bars via `MinuteBarView` and a parallel
+   `state.minute_model_cache` (HMM/GARCH/OU/Hawkes fit on minute bars,
+   via `fit_minute_models_for_symbol()`). If this qualifies, that trade
+   fires directly — **nothing else below it even runs** this cycle.
+2. **LSTM standalone** (`lstm_evaluate`, unchanged from v8) — only
+   reached if step 1 didn't qualify.
+3. **Tick-gate pipeline** (the original, all-ticks Gates 1-6) — the true
+   fallback now, only reached if neither of the above produced anything.
+
+**What this does NOT include (scoped down deliberately, see below)**:
+the tick path's adaptive per-symbol thresholds and walk-forward-learned
+per-layer weights come from `expanding_window_walk_forward()` — a
+multi-fold backtesting routine that's expensive and needs a lot of
+history. The minute path's models are fit directly (no walk-forward OOS
+validation, no learned layer weights) and use `per_layer_weights=None`
+(static defaults) plus the SAME `state.adaptive_threshold` /
+`state.per_symbol_threshold` / `state.reliability` tracking the tick path
+already maintains per symbol — shared, not duplicated, since both paths
+trade the same underlying symbol just resampled differently. If the
+minute path's win rate ends up systematically different from the tick
+path's, those shared adaptive mechanisms will still drift toward
+whatever's actually working, just without the head start a full
+walk-forward fit would give it. Building a full parallel walk-forward
+validator for minute bars would be a further, separate undertaking — say
+the word if you want that too.
+
+**A real practical constraint worth knowing**: `MinuteBarView` resamples
+from the bot's own in-memory tick buffer (`SymbolData`, `maxlen`-bounded),
+not from `risefall-trainer`'s persistent Supabase minute-bar archive. For
+a 1HZ symbol at the default buffer size that's roughly ~200 minutes of
+history — workable for Gates 1-5's shorter internal windows and for
+fitting HMM/GARCH/OU/Hawkes, but thinner than what the trainer
+accumulates over days via its archive. If richer live minute history
+turns out to matter, the same archive pattern could be added to the bot
+too.
+
 ## What Gate 6 (the LSTM ensemble) actually changes
 
-- Gate 6 is a **hard veto**, not a diagnostic — different from Gate 5's
-  HMM/GBM Monte Carlo, which only vetoes borderline signals. If the LSTM
-  ensemble disagrees with the layer stack's direction, the trade is
-  skipped, on every signal, not just weak ones. This is deliberate: the
+- **v9: minute-duration trading is now the PRIMARY path, tick is the
+  FALLBACK — architecturally, not just a priority tiebreak.** Every scan
+  cycle, the LSTM ensemble is checked FIRST, before the tick-gate
+  pipeline (Gates 1-5) even runs. If it already has a confident MINUTE-
+  duration opinion (`LSTM_MIN_EDGE_STANDALONE`, default 0.12) on a
+  symbol, that trade fires directly and the tick-gate pipeline is
+  skipped entirely for that symbol that cycle — no wasted compute on 5
+  gates that were never going to matter. The tick-gate pipeline only
+  runs when the LSTM has nothing confident to say in minutes. This
+  applies to both the normal scan loop and the martingale recovery path
+  (which scans every ready symbol's LSTM ensemble independently before
+  falling back to its own tick-based pick).
+  **The confidence bar itself is unchanged** — this restructure changes
+  *which path runs first*, not how confident the LSTM has to be. If you
+  want minute trades to fire more often given the model's current edge
+  levels, lower `LSTM_MIN_EDGE_STANDALONE` (and/or `LSTM_MIN_EDGE_FOR_MINUTE`
+  for the in-pipeline override path below) — that's the intended lever,
+  not a code change.
+- Within `lstm_duration_scan()` itself (`risefall_lstm_model.py`), the
+  same priority applies one level down: whenever the minute model
+  produces anything usable at all, it's used, even if some tick
+  candidate happened to have a higher raw edge. Tick is only considered
+  when minute has nothing (model not loaded, window too short, or every
+  minute candidate exceeded the uncertainty cap).
+- Gate 6 is still a **hard veto**, not a diagnostic, inside the tick-gate
+  fallback pipeline — if the LSTM ensemble disagrees with the layer
+  stack's direction there, the trade is skipped. This is deliberate: the
   LSTM is the model `risefall-trainer` actually optimizes and re-uploads
   every cron cycle (unlike its five comparison baselines — persistence,
   AR(1)/Hurst, a GBM, a GRU, a dilated CNN — which stay diagnostic-only
@@ -143,57 +230,68 @@ CREATE INDEX IF NOT EXISTS idx_risefall_minute_bars_symbol_epoch
   `risefall-trainer`'s `baseline_comparison` logs show the LSTM reliably
   beating its persistence baseline (and ideally the richer AR(1)/GBM/GRU/
   CNN ones too) over a few cron cycles, then flip it on.
-- **v8: the LSTM ensemble can now originate a trade entirely on its own**
-  (`LSTM_MIN_EDGE_STANDALONE`, default 0.12 -- a higher confidence bar
-  than the minute-override threshold below, since a standalone LSTM trade
-  has none of Gates 1-5's tick-based corroboration behind it). Previously
-  a trained minute model could only ever ride along on top of an already-
-  qualified tick trade, as a duration swap -- if the tick-based layer
-  stack (Gates 1-5) didn't qualify a symbol that cycle, the minute
-  model's opinion never got a chance to matter, no matter how confident
-  it was. Now both pipelines run independently every cycle, and
-  **whichever is rated higher wins** -- rating is `|p-0.5|` (edge) for
-  both, since that's directly comparable regardless of which one produced
-  it. Watch for `[Signal]`/`[LSTM]` log lines showing which pipeline's
-  pick actually got traded. The atomic final recheck immediately before
-  firing also branches correctly by source: a `tick_gates` trade still
-  gets Gate 1 re-verified right before execution (unchanged); an
-  `lstm_standalone` trade gets the ensemble itself re-verified instead
-  (re-checking Gate 1 on a trade Gate 1 was never part of would defeat
-  the whole point).
-- When the **minute-bar** model (not the tick model) produces the most
-  confident read in a given cycle — low ensemble disagreement, meaningful
-  edge, direction already agreeing with the layer stack (Gate 6 already
-  vetoed any disagreement above) — the bot will attempt a minute-duration
-  Rise/Fall contract instead of its usual tick contract. If Deriv doesn't
-  support minute-duration contracts for that particular symbol, the buy
+- If Deriv rejects `duration_unit="m"` for a particular symbol, the buy
   attempt fails and the bot immediately retries the same trade as a tick
-  contract in the same cycle — no trade is ever dropped because of this.
+  contract in the same cycle (the tick MC pick is always kept as a
+  same-cycle fallback duration) — no trade is ever dropped because of
+  this.
 - Until the trainer has completed at least one successful run of each
-  `MODEL_KIND`, both models are simply absent and Gate 6 is a no-op (same
-  as `LSTM_ENABLED=false`) — it never blocks trades it has no opinion on,
-  and the standalone-origination path above simply never fires either.
+  `MODEL_KIND`, both models are simply absent and every LSTM-related
+  check is a no-op (same as `LSTM_ENABLED=false`) — the bot falls
+  straight through to the tick-gate pipeline every cycle, same as before
+  any of this existed.
 - The trainer now trains **one shared model pooled across a whole basket
   of symbols** (see its README), not just `1HZ10V` — normalization is
   per-window/local (`local_normalize()` in `risefall_lstm_model.py`), so
   the same model applies sanely to any symbol regardless of that symbol's
   native volatility scale, including ones outside the trainer's basket.
+- Trade summaries (`emit_sequence_summary`/`log_trade_summary`) now
+  correctly report `minutes` vs `ticks` based on what was actually
+  traded — previously this was hardcoded to always print "ticks"
+  regardless of `duration_unit`, which would have silently misreported
+  any minute trade that did fire.
 
-- **v8: minute takes priority over tick, not just "whichever is rated
-  highest".** Both at the model level (`lstm_duration_scan()` in
-  `risefall_lstm_model.py` returns the minute model's best pick whenever
-  it produced anything usable, regardless of whether some tick pick had
-  a numerically higher edge) and at the candidate-selection level in the
-  bot (among whichever of the tick-gate and lstm-standalone candidates
-  qualified this cycle, any with `duration_unit=="m"` is preferred over
-  any with `"t"` outright — edge/rating only breaks ties among
-  same-duration-unit candidates). Tick is the fallback, used only when no
-  minute candidate is available or confident enough this cycle.
-- **This applies to the martingale recovery path too** (continuing an
-  already-lost sequence), not just fresh trade origination — the LSTM
-  ensemble is scanned across every ready symbol independently of the
-  tick-based recovery pick, and the same minute-priority / whichever-
-  rated-higher logic decides which one (and which symbol) actually fires.
+## Two other real bugs fixed in this pass
+
+**1. Crash loop on every drift-triggered recalibration.**
+`check_calibration_triggers()` returns `("drift", [list of flagged
+symbols])`, but `run_calibration()`'s startup print assumed the second
+element was always a plain string (`':' + loss_symbol`), which raised
+`TypeError: can only concatenate str (not "list") to str` on every single
+drift event. The bot's watchdog catches this and restarts the process in
+place, so it wasn't fatal, but it meant the bot could spend most of its
+time crash-looping through `deep_startup_calibration()` (meant to run
+ONCE per process lifetime) instead of ever settling into steady-state
+trading. Fixed to handle every shape `trigger_reason`'s second element
+can actually take (list, string, or `None`).
+
+**2. Directional bias from `ConfidenceCalibrator`.** This one was a real
+find, not something I noticed on my own — full credit for tracing it to
+`expanding_window_walk_forward()`'s outcome label. The walk-forward
+report was labeling each training example `won = (predicted_dir ==
+actual_dir)` — a symmetric "was the prediction correct" label — and
+feeding that into a calibrator whose whole job is producing a
+*directional* `P(up)` estimate. A confident, genuinely-correct PUT call
+and a confident, genuinely-correct CALL call both score `won=1`
+identically, so the fitted isotonic table ends up mapping "this
+confidence level" to a *win rate*, not to `P(up)` — and `calibrate()`
+blends that win rate straight into a probability of the wrong thing.
+Reproducing the exact scenario confirmed it's worse than it first looks:
+the temperature-scaling stage collapses almost *all* directional signal
+(a synthetic model with genuine, symmetric 70% accuracy calibrated a
+confident PUT and a confident CALL to nearly the same ~0.63, since a
+direction-blind label gives the temperature fit nothing informative to
+distinguish them), and the isotonic stage on top of that further dragged
+confident PUTs toward CALL specifically. Fixed by changing the label fed
+into calibration to "did price actually go up" — symmetric with what
+`p_up` itself means — while leaving the separate, legitimately-symmetric
+hit-rate/accuracy reporting (`per_duration_outcomes`, `hits_fold`, the
+per-fold hit rate you see in calibration logs) untouched, since "how
+often is the model right" is a different, correctly-symmetric question
+from "what does this confidence level imply about direction".
+**This bug would have applied to both tick and minute trading equally**
+— it's upstream of the duration/unit decision entirely, in the
+directional confidence signal every gate consumes.
 
 ## Safety notes
 

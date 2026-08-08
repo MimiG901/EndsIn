@@ -764,6 +764,14 @@ class TradeState:
         self.last_scheduled_calibration = time.time()
         self.last_calibration_end = 0.0
         self.model_cache: Dict[str, "SymbolModels"] = {}
+        # v9: minute-bar-fit models (HMM/GARCH/OU/Hawkes), parallel to
+        # model_cache above but fit on MinuteBarView data instead of raw
+        # ticks -- see fit_minute_models_for_symbol(). Absent entries just
+        # mean "no minute model yet for this symbol" (insufficient minute
+        # bars, or calibration hasn't reached it this cycle); every
+        # minute-native call site treats that as a clean fallback to the
+        # tick path, never a crash.
+        self.minute_model_cache: Dict[str, "SymbolModels"] = {}
         self.last_activity = time.time()
 
         # Threshold: per-symbol, derived from each symbol's own OOS confidence
@@ -860,6 +868,7 @@ class TradeState:
         self.seq_p_up      = 0.5
         self.seq_confidence= 0.0
         self.seq_duration  = 0
+        self.seq_duration_unit = "t"
 
 
 @dataclass
@@ -918,29 +927,21 @@ class SymbolData:
             new_sd.add_tick(e, p)
         return new_sd
 
-    def minute_bar_returns(self, max_bars: Optional[int] = None):
-        """Resamples the buffered tick stream into one-per-minute
-        last-observed-price bars, using the SAME last-observation /
-        forward-fill convention as risefall_lstm_train.build_minute_bars()
-        -- so the live minute LSTM model sees the same kind of series it
-        was trained on (settlement-instant price, not a synthetic OHLC
-        close; gaps forward-filled, never interpolated).
-
-        Returns simple returns (diff/price), oldest -> newest, trimmed to
-        the most recent `max_bars` bars if given (+1 extra bar so the
-        diff still yields exactly max_bars returns). Empty array if fewer
-        than 2 distinct minutes are buffered yet -- caller treats that the
-        same as "minute model not available for this symbol right now"."""
+    def _minute_bars(self, max_bars: Optional[int] = None):
+        """Shared resampling core for minute_bar_returns()/minute_bar_prices()
+        below -- one-per-minute last-observed-price bars, forward-filled
+        across any gap, oldest -> newest. Returns (epochs, prices), both
+        empty if fewer than 2 distinct minutes are buffered."""
         epochs = self.epochs()
         prices = self.prices()
         if len(epochs) < 2:
-            return np.array([])
+            return np.array([]), np.array([])
 
         minute_idx = (epochs // 60).astype(np.int64)
         first_min, last_min = int(minute_idx[0]), int(minute_idx[-1])
         n_minutes = last_min - first_min + 1
         if n_minutes < 2:
-            return np.array([])
+            return np.array([]), np.array([])
 
         bar_prices = np.full(n_minutes, np.nan, dtype=float)
         rel_idx = minute_idx - first_min   # non-decreasing -> last write wins
@@ -954,11 +955,99 @@ class SymbolData:
             if np.isnan(bar_prices[0]):
                 bar_prices[:1] = prices[0]
 
-        if max_bars is not None and n_minutes > max_bars + 1:
-            bar_prices = bar_prices[-(max_bars + 1):]
+        bar_epochs = (np.arange(n_minutes) + first_min) * 60.0
+        if max_bars is not None and n_minutes > max_bars:
+            bar_epochs = bar_epochs[-max_bars:]
+            bar_prices = bar_prices[-max_bars:]
+        return bar_epochs, bar_prices
+
+    def minute_bar_returns(self, max_bars: Optional[int] = None):
+        """Resamples the buffered tick stream into one-per-minute
+        last-observed-price bars, using the SAME last-observation /
+        forward-fill convention as risefall_lstm_train.build_minute_bars()
+        -- so the live minute LSTM model sees the same kind of series it
+        was trained on (settlement-instant price, not a synthetic OHLC
+        close; gaps forward-filled, never interpolated).
+
+        Returns simple returns (diff/price), oldest -> newest, trimmed to
+        the most recent `max_bars` bars if given (+1 extra bar so the
+        diff still yields exactly max_bars returns). Empty array if fewer
+        than 2 distinct minutes are buffered yet -- caller treats that the
+        same as "minute model not available for this symbol right now"."""
+        _, bar_prices = self._minute_bars(None if max_bars is None else max_bars + 1)
         if len(bar_prices) < 2:
             return np.array([])
         return np.diff(bar_prices) / bar_prices[:-1]
+
+    def minute_bar_prices(self, max_bars: Optional[int] = None):
+        """Same resampling as minute_bar_returns() but returns the price
+        LEVEL series itself (not returns) -- what MinuteBarView.prices()
+        below hands to compute_features()/fit_symbol_models(), which
+        compute their own returns internally the same way SymbolData.
+        returns() does."""
+        _, bar_prices = self._minute_bars(max_bars)
+        return bar_prices
+
+    def minute_bar_epochs(self, max_bars: Optional[int] = None):
+        bar_epochs, _ = self._minute_bars(max_bars)
+        return bar_epochs
+
+
+class MinuteBarView:
+    """Thin adapter presenting a SymbolData's resampled MINUTE bars through
+    the exact same interface SymbolData itself exposes (.symbol, .prices(),
+    .epochs(), .returns(), .mean_tick_dt()) -- v9: this is what makes it
+    possible to feed the entire existing tick-native analytical stack
+    (compute_features(), fit_symbol_models(), and transitively every Gates
+    1-5 + Monte Carlo function that consumes their output) MINUTE-bar data
+    with zero changes to any of that code. Those functions were audited
+    (see conversation history) to confirm they only ever touch `sd` through
+    exactly this interface -- hmm_gbm_scan(), monte_carlo_duration(),
+    entropy_gate_passes(), multi_timeframe_confluence(), and
+    meta_ensemble_agrees() don't even take `sd` at all, just plain
+    prices/returns arrays, so they're already fully data-agnostic.
+
+    Built fresh once per symbol per scan cycle from the live SymbolData's
+    buffered ticks -- NOT backed by the trainer's persistent Supabase
+    minute-bar archive, so it's limited to however many minutes the bot's
+    own in-memory tick buffer (SymbolData(maxlen=...)) currently spans.
+    For a 1HZ symbol at the default maxlen=12000 that's up to ~200
+    minutes -- enough for WINDOW_SIZE_MINUTES=200-bar LSTM lookback with
+    little to spare, and enough for Gates 1-5's shorter internal windows,
+    but thinner than the trainer's archive-backed training data. If a
+    richer live minute-bar history turns out to matter, the same
+    Supabase-archive pattern from risefall-trainer could be added here
+    too -- not implemented in this pass."""
+
+    def __init__(self, sd: "SymbolData", max_bars: Optional[int] = None):
+        self.symbol = sd.symbol
+        self._epochs = sd.minute_bar_epochs(max_bars)
+        self._prices = sd.minute_bar_prices(max_bars)
+        # Real seconds between bars -- always 60 by construction (one bar
+        # per minute), NOT sd.tick_dt. Fed straight into fit_symbol_models()
+        # -> fit_ou()/fit_symbol_hawkes() etc, which parameterize by actual
+        # measured dt rather than assuming tick-scale timing, so this alone
+        # is what makes those fits statistically correct for minute-scale
+        # data rather than silently reusing tick-scale assumptions.
+        self.tick_dt = 60.0
+
+    def prices(self) -> np.ndarray:
+        return self._prices
+
+    def epochs(self) -> np.ndarray:
+        return self._epochs
+
+    def returns(self) -> np.ndarray:
+        p = self._prices
+        if len(p) < 2:
+            return np.array([])
+        return np.diff(p) / p[:-1]
+
+    def mean_tick_dt(self) -> float:
+        return 60.0
+
+    def has_data(self, min_bars: int = 30) -> bool:
+        return len(self._prices) >= min_bars
 
 
 # ---------------------------------------------------------------------------
@@ -2241,6 +2330,23 @@ def copula_agreement(symbol, returns_window_dict):
 # ---------------------------------------------------------------------------
 # MODEL FITTING ORCHESTRATOR (runs only during calibration)
 # ---------------------------------------------------------------------------
+def fit_minute_models_for_symbol(sd, min_bars: int = 90) -> Optional["SymbolModels"]:
+    """v9: fits HMM/GARCH/OU/Hawkes on this symbol's MINUTE bars instead of
+    raw ticks, via the MinuteBarView adapter -- reuses fit_symbol_models()
+    completely unmodified (see that adapter's docstring for why that's
+    safe). Returns None (not an exception) if there aren't enough minute
+    bars buffered yet -- the bot's own in-memory tick buffer bounds how
+    much minute history is available (unlike risefall-trainer, which has
+    a persistent Supabase archive); callers treat None as "no minute
+    model this cycle, fall back to tick" everywhere, same as an absent
+    model_cache entry already does today."""
+    mv = MinuteBarView(sd)
+    if not mv.has_data(min_bars):
+        return None
+    models = fit_symbol_models(mv)
+    return models if models.fitted else None
+
+
 def fit_symbol_models(sd) -> SymbolModels:
     models = SymbolModels()
     returns = sd.returns()
@@ -2664,7 +2770,13 @@ class ConfidenceCalibrator:
         """
         Fit temperature T that minimises NLL(outcomes | sigmoid(logit(conf)/T)).
         confidences: raw p_up values in (0,1)
-        outcomes: 1=win, 0=loss
+        outcomes: 1 = price actually went up, 0 = it went down. NOT "was the
+            prediction correct" -- that label is symmetric/direction-blind
+            (a good PUT call and a good CALL call would both score 1), and
+            feeding it into a calibrator whose output gets used as a
+            directional P(up) silently biases the bot toward whichever
+            side historically won more. See expanding_window_walk_forward()
+            for the full writeup of this bug and its fix.
         Returns T (positive float). T=1.0 means no calibration needed.
         """
         if len(confidences) < 50:
@@ -2692,6 +2804,12 @@ class ConfidenceCalibrator:
                      outcomes: np.ndarray, n_bins: int = 10) -> Optional[tuple]:
         """
         Fit a piecewise-monotonic mapping in n_bins equal-frequency bins.
+        confidences: raw p_up values in (0,1); outcomes: 1 = price actually
+            went up, 0 = it went down (see fit_temperature()'s docstring --
+            this must be direction-symmetric with what p_up means, not
+            "was the prediction correct", or the resulting bin_win_rates
+            are win rates, not P(up) estimates, and calibrate() below ends
+            up blending a win rate into a directional probability).
         Returns (bin_edges, bin_win_rates) tuple or None if insufficient data.
         """
         if len(confidences) < 50:
@@ -2738,7 +2856,9 @@ class ConfidenceCalibrator:
     @staticmethod
     def fit_and_save(state: "TradeState", symbol: str,
                      raw_p_ups: List[float], outcomes: List[float]):
-        """Fit temperature + isotonic calibrators from OOS prediction history."""
+        """Fit temperature + isotonic calibrators from OOS prediction history.
+        outcomes must be "did price actually go up" (1/0), not "was the
+        prediction correct" -- see fit_temperature()'s docstring."""
         if len(raw_p_ups) < 50:
             return
         conf  = np.array(raw_p_ups)
@@ -3274,11 +3394,27 @@ def hmm_gbm_scan(prices: np.ndarray, returns: np.ndarray,
         combined = np.concatenate([gbm_log_ret, boot_log_ret])
         p_up = float(np.mean(combined > 0))
 
-        for direction, p in ((1, p_up), (-1, 1.0 - p_up)):
-            grid[(direction, dur)] = p
-            edge = abs(p - 0.5)
-            if best is None or edge > best["edge"]:
-                best = {"direction": direction, "duration": dur, "p": p, "edge": edge}
+        # BUGFIX (2026-08-06): same structural bug as lstm_duration_scan()'s
+        # _consider() (see risefall_lstm_model.py) -- this generated TWO
+        # "candidates" per duration, (direction=+1, p_up) and (direction=-1,
+        # 1.0-p_up), and compared edges with a strict `>`. But p_up here is
+        # a SINGLE simulated probability (mean(combined > 0)), not two
+        # independently-simulated directional outcomes despite the
+        # docstring's "independently sweeps BOTH direction" description --
+        # abs(p_up-0.5) and abs((1-p_up)-0.5) are mathematically identical,
+        # so direction=+1 (constructed first) could never lose a genuine
+        # tie, and only floating-point rounding noise on 1.0-p_up could
+        # ever flip it to PUT. This made hmm_gbm_scan -- the PRIMARY Monte
+        # Carlo signal, not just the LSTM one -- structurally CALL-biased
+        # on ambiguous grid points. A single simulated p_up can only
+        # support one direction; decide it once, directly from which side
+        # of 0.5 it falls on.
+        direction = 1 if p_up >= 0.5 else -1
+        p = p_up if direction == 1 else 1.0 - p_up
+        grid[(direction, dur)] = p
+        edge = abs(p - 0.5)
+        if best is None or edge > best["edge"]:
+            best = {"direction": direction, "duration": dur, "p": p, "edge": edge}
 
     best["grid"] = grid
     best["hmm_used"] = hmm_used
@@ -3776,7 +3912,8 @@ def log_trade(symbol, direction, stake, won, profit, step):
 
 
 def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
-                      balance_before, balance_after, p_up, confidence, duration):
+                      balance_before, balance_after, p_up, confidence, duration,
+                      duration_unit="t"):
     """Printed once after a full martingale sequence resolves (win or full loss).
     Gives a compact but complete picture of what happened and what it cost."""
     ts        = datetime.utcnow().isoformat()
@@ -3787,11 +3924,12 @@ def log_trade_summary(symbol, direction, stakes_used, profits, sequence_won,
     outcome   = "✓ WON" if sequence_won else "✗ LOST ALL STEPS"
     bal_delta = balance_after - balance_before
     sep       = "─" * 60
+    unit_label = "minutes" if duration_unit == "m" else "ticks"
 
     print(f"\n{sep}")
     print(f"  TRADE SUMMARY  {ts}")
     print(sep)
-    print(f"  Symbol    : {symbol}   {side}   {duration} ticks")
+    print(f"  Symbol    : {symbol}   {side}   {duration} {unit_label}")
     print(f"  Signal    : p_up={p_up:.4f}   confidence={confidence:.4f}")
     print(f"  Outcome   : {outcome}")
     print(f"  Steps used: {n_steps} / {MARTINGALE_MAX_STEPS + 1}")
@@ -3931,7 +4069,8 @@ def clear_recovery(state):
     state.seq_stakes_committed = 0.0   # FIX v2: reset sequence loss guard
 
 
-def reset_sequence_accumulator(state, balance_now, p_up=0.5, confidence=0.0, duration=0):
+def reset_sequence_accumulator(state, balance_now, p_up=0.5, confidence=0.0, duration=0,
+                               duration_unit="t"):
     """Called at the START of a new sequence (step=0 entry). Resets all
     per-sequence tracking so the summary log reflects only this sequence."""
     state.seq_stakes         = []
@@ -3940,6 +4079,7 @@ def reset_sequence_accumulator(state, balance_now, p_up=0.5, confidence=0.0, dur
     state.seq_p_up           = p_up
     state.seq_confidence     = confidence
     state.seq_duration       = duration
+    state.seq_duration_unit  = duration_unit
 
 
 def emit_sequence_summary(state, symbol, direction, sequence_won):
@@ -3955,6 +4095,7 @@ def emit_sequence_summary(state, symbol, direction, sequence_won):
         p_up          = state.seq_p_up,
         confidence    = state.seq_confidence,
         duration      = state.seq_duration,
+        duration_unit = getattr(state, "seq_duration_unit", "t"),
     )
 
 
@@ -4086,7 +4227,36 @@ def expanding_window_walk_forward(sd, n_folds=5, horizons=None, step=3):
                 actual_dir   = 1 if future_price > current_price else -1
                 won = int(predicted_dir == actual_dir)
                 if h == mid_h:
-                    all_outcomes.append(float(won))   # v3: outcome for calibration
+                    # v9 FIX (real directional-bias bug): the calibrator
+                    # consumes (raw_p_up, outcome) pairs and learns a
+                    # mapping from raw_p_up -> calibrated P(up). That only
+                    # makes sense if `outcome` means the same thing p_up
+                    # means -- "did price actually go up" -- not "was the
+                    # prediction correct". Those two labels agree when
+                    # predicted_dir==+1 but are OPPOSITES when
+                    # predicted_dir==-1, so feeding `won` in here silently
+                    # trained the isotonic table on "P(this confidence
+                    # level was right)" and then blended that WIN RATE
+                    # directly into a P(up) value in
+                    # ConfidenceCalibrator.calibrate(). A confident, correct
+                    # PUT (raw p_up=0.15, high win rate ~0.7 in that low-p_up
+                    # bin) got dragged toward p_cal=0.535 -- effectively
+                    # flipped toward CALL -- while a confident, correct CALL
+                    # (p_up=0.85) was barely touched, since for that side
+                    # "high win rate" and "high P(up)" happen to point the
+                    # same direction. The result was a one-way ratchet: once
+                    # a few CALLs landed, every subsequent PUT signal got
+                    # diluted or inverted by calibration itself, downstream
+                    # of bayesian_fusion's own recent_call_ratio bias
+                    # correction -- which can't fix a distortion introduced
+                    # AFTER it runs. Fixed by using the symmetric,
+                    # direction-correct label here: did price actually go
+                    # up, full stop. `won` (prediction-correctness) is still
+                    # exactly right for the hit-rate/accuracy reporting
+                    # below (per_duration_outcomes, hits_fold) -- that's a
+                    # genuinely different, legitimately symmetric question
+                    # ("how often is the model right") and stays untouched.
+                    all_outcomes.append(float(actual_dir == 1))
                 per_duration_outcomes[h][0] += won
                 per_duration_outcomes[h][1] += 1
                 if h == mid_h:
@@ -4273,6 +4443,21 @@ async def deep_startup_calibration(state, symbol_data, symbols):
 
             state.model_cache[s] = m
 
+            # v9: fit the parallel MINUTE-bar model stack too, so the
+            # minute-native gate pipeline (try_minute_gates_candidate())
+            # has something to work with from the very first calibration
+            # cycle onward. Non-fatal/silent if there isn't enough minute
+            # history yet -- that symbol just falls back to tick-native
+            # gates until a later calibration cycle has more minute bars
+            # buffered.
+            minute_m = fit_minute_models_for_symbol(sd)
+            if minute_m is not None:
+                state.minute_model_cache[s] = minute_m
+                print(f"  Minute model      : fitted ({len(sd.minute_bar_prices())} bars)")
+            else:
+                state.minute_model_cache.pop(s, None)
+                print(f"  Minute model      : not enough minute bars yet")
+
             # ── Warm-start: blend Supabase-persisted weights ───────────────
             pending = state._pending_weights.get(s)
             if pending:
@@ -4402,7 +4587,18 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
     state.trading_locked = True
     kind, loss_symbol = trigger_reason
     start = time.time()
-    print(f"[Calibrator] starting (trigger={kind}{':' + loss_symbol if loss_symbol else ''}). Trading locked.")
+    # loss_symbol's shape depends on `kind`: check_calibration_triggers()
+    # returns ("drift", [list of flagged symbols]) or ("scheduled", None) --
+    # never a single bare string, despite what this print used to assume
+    # (`':' + loss_symbol`, which crashed with a TypeError on every single
+    # drift-triggered recalibration: "can only concatenate str (not 'list')
+    # to str"). Handle every shape this can actually take.
+    if loss_symbol:
+        detail = ':' + (','.join(loss_symbol) if isinstance(loss_symbol, (list, tuple))
+                        else str(loss_symbol))
+    else:
+        detail = ''
+    print(f"[Calibrator] starting (trigger={kind}{detail}). Trading locked.")
 
     if kind == "loss_triggered":
         state.loss_triggered_calibrations_24h.append(start)
@@ -4433,6 +4629,16 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
                         for k in all_keys
                     }
             state.model_cache[s] = models
+
+            # v9: same parallel minute-bar model fit as deep_startup_
+            # calibration -- keeps the minute-native gate pipeline's
+            # models fresh on every recalibration cycle too, not just at
+            # startup.
+            minute_m = fit_minute_models_for_symbol(sd)
+            if minute_m is not None:
+                state.minute_model_cache[s] = minute_m
+            else:
+                state.minute_model_cache.pop(s, None)
         state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
         state.consecutive_losses[s] = 0
         all_confidences.extend(confidences)
@@ -4675,6 +4881,19 @@ async def main():
             continue
 
         returns_window_dict = {s: symbol_data[s].returns()[-200:] for s in ready_symbols}
+        # v9: minute-bar analog, for copula_agreement() inside
+        # compute_features() when called against a MinuteBarView. Built
+        # once per outer-loop iteration here (not per-symbol inside the
+        # gate closures below) since copula_agreement needs every ready
+        # symbol's series at once, same reasoning as the tick version
+        # above. Symbols with too little minute history simply won't
+        # have an entry -- copula_agreement() already tolerates a
+        # smaller cross-symbol set.
+        minute_returns_window_dict = {}
+        for s in ready_symbols:
+            mv_s = MinuteBarView(symbol_data[s], max_bars=201)
+            if mv_s.has_data(30):
+                minute_returns_window_dict[s] = mv_s.returns()[-200:]
 
         # ── RECOVERY MODE ────────────────────────────────────────────────────
         # No symbol, direction, or duration lock. Recovery is a fresh open scan
@@ -4819,29 +5038,122 @@ async def main():
                     "feats": feats_l, "n_agree": None,
                 }
 
-            tick_candidate = try_tick_recovery_candidate()
-            lstm_candidate = try_lstm_standalone_recovery()
+            def try_minute_gates_recovery_candidate():
+                """v9: the minute-native Gates 1-6 + MC pipeline (same one
+                try_minute_gates_candidate() runs in the normal scan loop),
+                scanned across every ready symbol and returning the single
+                best-by-rating qualifying candidate, or None -- recovery's
+                "one best pick across every ready symbol" shape, same
+                adaptation try_lstm_standalone_recovery() above already
+                makes for the LSTM-only path."""
+                best = None
+                for rs in ready_symbols:
+                    sd_m = symbol_data[rs]
+                    mv = MinuteBarView(sd_m)
+                    if not mv.has_data(60):
+                        continue
+                    m_models = state.minute_model_cache.get(rs)
+                    if m_models is None:
+                        continue
 
-            # v8: MINUTE TAKES PRIORITY OVER TICK, then whichever is rated
-            # higher -- identical policy to the normal scan loop above.
-            available = [c for c in (tick_candidate, lstm_candidate) if c is not None]
-            if not available:
-                continue
-            minute_available = [c for c in available if c["duration_unit"] == "m"]
-            pool = minute_available if minute_available else available
-            chosen = max(pool, key=lambda c: c["rating"])
+                    feats_m = compute_features(mv, m_models, minute_returns_window_dict)
+                    if feats_m is None:
+                        continue
+                    p_up_m, confidence_m = fuse_signal(feats_m, state, rs)
+                    direction_m = 1 if p_up_m > 0.5 else -1
+                    minute_returns = mv.returns()
 
-            if len(available) > 1:
-                print(f"[Signal/Recovery] candidates this cycle -- " +
-                     ", ".join(f"{c['symbol']}/{c['source']}({c['duration_unit']}, "
-                              f"rating={c['rating']:.3f})" for c in available) +
-                     f" -- trading {chosen['symbol']}/{chosen['source']} "
-                     f"({'minute-priority' if minute_available else 'no minute candidate, tick fallback'}).")
-            elif chosen["source"] == "lstm_standalone":
-                print(f"[LSTM/Recovery]: tick-based recovery pipeline did not qualify this "
-                      f"cycle, but the LSTM ensemble independently likes {chosen['symbol']} "
+                    mc_duration_m, exp_win_rate_m = monte_carlo_duration(
+                        mv.prices(), minute_returns, direction_m, feats_m,
+                        CANDIDATE_DURATIONS_MINUTES, models=m_models
+                    )
+                    if exp_win_rate_m < MIN_EXP_WIN_RATE:
+                        continue
+
+                    gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats_m, direction_m)
+                    if not gate_ok:
+                        continue
+                    pe_ok, _ = entropy_gate_passes(mv.prices())
+                    if not pe_ok:
+                        continue
+                    tf_agree, _ = multi_timeframe_confluence(mv.prices(), direction_m)
+                    if tf_agree < MIN_TF_AGREEMENT:
+                        continue
+                    bs_agrees, _ = meta_ensemble_agrees(minute_returns, direction_m,
+                                                        mc_duration_m, exp_win_rate_m)
+                    if not bs_agrees:
+                        continue
+
+                    mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                                             hmm_model=getattr(m_models, "hmm_model", None))
+                    sym_score_m = confidence_m * state.reliability.get(rs, 1.0)
+                    sym_thr_m   = state.per_symbol_threshold.get(rs, state.adaptive_threshold)
+                    if (mc_scan_m["direction"] != direction_m
+                            and sym_score_m < MC_BORDERLINE_MULTIPLIER * sym_thr_m):
+                        continue
+
+                    lstm_best_m = lstm_evaluate(sd_m)
+                    if lstm_best_m is not None and lstm_best_m["direction"] != direction_m:
+                        continue
+
+                    rating = abs(float(p_up_m) - 0.5)
+                    if best is None or rating > best["rating"]:
+                        best = {
+                            "source": "minute_gates", "symbol": rs,
+                            "direction": direction_m, "p_up": float(p_up_m),
+                            "confidence": float(confidence_m), "exp_win_rate": float(exp_win_rate_m),
+                            "rating": rating, "duration": mc_duration_m,
+                            "exec_duration": mc_duration_m, "duration_unit": "m",
+                            "feats": feats_m, "n_agree": n_agree,
+                        }
+                return best
+
+            # v9: MINUTE-FIRST ARCHITECTURE. try_minute_gates_recovery_
+            # candidate() (full Gates 1-6 + MC on minute bars, scanned
+            # across every ready symbol) is tried FIRST -- if it qualifies
+            # on its own, that trade fires directly and NEITHER the LSTM-
+            # standalone check NOR the tick-based recovery pipeline run
+            # this cycle.
+            minute_gates_candidate = try_minute_gates_recovery_candidate()
+
+            if minute_gates_candidate is not None:
+                chosen = minute_gates_candidate
+                tick_candidate = None
+                print(f"[Minute/Recovery]: minute-native Gates 1-6 + MC pipeline qualifies "
+                      f"on its own -- {chosen['symbol']} "
                       f"{'CALL' if chosen['direction']>0 else 'PUT'} (p={chosen['p_up']:.3f} "
-                      f"edge={chosen['rating']:.3f}) -- trading on that.")
+                      f"rating={chosen['rating']:.3f}) -- trading it directly, LSTM-standalone "
+                      f"check and tick-based recovery pipeline both skipped this cycle.")
+            else:
+                lstm_candidate = try_lstm_standalone_recovery()
+
+                if lstm_candidate is not None and lstm_candidate["duration_unit"] == "m":
+                    chosen = lstm_candidate
+                    tick_candidate = None
+                    print(f"[LSTM/Recovery]: minute-priority pick clears the bar on its own -- "
+                          f"{chosen['symbol']} {'CALL' if chosen['direction']>0 else 'PUT'} "
+                          f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading it "
+                          f"directly, tick-based recovery pipeline skipped this cycle.")
+                else:
+                    tick_candidate = try_tick_recovery_candidate()
+                    available = [c for c in (tick_candidate, lstm_candidate) if c is not None]
+                    if not available:
+                        continue
+                    minute_available = [c for c in available if c["duration_unit"] == "m"]
+                    pool = minute_available if minute_available else available
+                    chosen = max(pool, key=lambda c: c["rating"])
+
+                    if len(available) > 1:
+                        print(f"[Signal/Recovery] candidates this cycle -- " +
+                             ", ".join(f"{c['symbol']}/{c['source']}({c['duration_unit']}, "
+                                      f"rating={c['rating']:.3f})" for c in available) +
+                             f" -- trading {chosen['symbol']}/{chosen['source']} "
+                             f"({'minute-priority' if minute_available else 'no minute candidate, tick fallback'}).")
+                    elif chosen["source"] == "lstm_standalone":
+                        print(f"[LSTM/Recovery]: tick-based recovery pipeline did not qualify this "
+                              f"cycle, but the LSTM ensemble independently likes {chosen['symbol']} "
+                              f"{'CALL' if chosen['direction']>0 else 'PUT'} (p={chosen['p_up']:.3f} "
+                              f"edge={chosen['rating']:.3f}) -- trading on that.")
 
             rec_sym   = chosen["symbol"]
             rec_dir   = chosen["direction"]
@@ -4862,7 +5174,7 @@ async def main():
                 duration=duration, exp_win=chosen["exp_win_rate"], score=chosen["rating"]
             )
 
-            # v8: ATOMIC final recheck immediately before firing -- which
+            # v8/v9: ATOMIC final recheck immediately before firing -- which
             # one applies depends on which pipeline actually originated
             # this trade, same reasoning as the normal scan loop's
             # execution block. execute_single_step()'s own feats-based
@@ -4873,6 +5185,19 @@ async def main():
                         or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
                     print(f"[LSTM/Recovery/Atomic] {rec_sym} blocked at execution -- "
                           f"ensemble's read moved between scan and fire.")
+                    continue
+                atomic_feats = None
+            elif recovery_source == "minute_gates":
+                mv_atomic = MinuteBarView(symbol_data[rec_sym])
+                m_models_atomic = state.minute_model_cache.get(rec_sym)
+                feats_minute_atomic = (
+                    compute_features(mv_atomic, m_models_atomic, minute_returns_window_dict)
+                    if m_models_atomic is not None and mv_atomic.has_data(60) else None)
+                gate_ok_m = (passes_layer_gate(feats_minute_atomic, rec_dir)[0]
+                            if feats_minute_atomic is not None else False)
+                if not gate_ok_m:
+                    print(f"[Minute/Recovery/Atomic] {rec_sym} blocked at execution -- "
+                          f"minute-native read moved between scan and fire.")
                     continue
                 atomic_feats = None
             else:
@@ -5096,69 +5421,193 @@ async def main():
                     "duration_unit": "m" if minute_override_duration else "t",
                 }
 
-            tick_candidate = try_tick_candidate()
+            def try_minute_gates_candidate():
+                """v9: the SAME Gates 1-6 + Monte Carlo pipeline as
+                try_tick_candidate() above, reused completely unmodified
+                but fed MINUTE-bar data via MinuteBarView instead of raw
+                ticks (see that adapter's docstring for why this is safe
+                -- every one of these functions was audited to confirm it
+                only touches its data through an interface MinuteBarView
+                also implements). This is the PRIMARY path in the v9
+                architecture: tried BEFORE everything else below, not
+                after. Returns a qualified candidate dict (always
+                duration_unit="m"), or None if minute data/models aren't
+                ready yet for this symbol or any gate rejects it -- either
+                way the caller falls through to the LSTM-standalone /
+                tick-gate fallback logic below, unchanged from before."""
+                mv = MinuteBarView(sd)
+                if not mv.has_data(60):
+                    return None
+                m_models = state.minute_model_cache.get(s)
+                if m_models is None:
+                    return None
 
-            # v8: the LSTM ensemble ALSO gets an independent shot at
-            # originating a trade on this symbol, regardless of whether
-            # the tick-gate pipeline above qualified -- "use both,
-            # whichever is rated highest". Before this, a trained minute
-            # model could only ever ride along on top of an already-
-            # qualified tick trade (as a duration swap); now it can win
-            # outright on its own, using its OWN direction and duration,
-            # if it's confident enough and the tick pipeline either
-            # didn't qualify or qualified with a smaller edge. Held to a
-            # HIGHER bar (LSTM_MIN_EDGE_STANDALONE) than the minute-
-            # override threshold above, since a standalone LSTM trade has
-            # none of Gates 1-5's tick-based corroboration behind it.
-            lstm_standalone = lstm_evaluate(sd)
-            lstm_candidate = None
-            if lstm_standalone is not None and lstm_standalone["edge"] >= LSTM_MIN_EDGE_STANDALONE:
-                lstm_candidate = {
-                    "source": "lstm_standalone",
-                    "direction": lstm_standalone["direction"],
-                    "p_up": lstm_standalone["p"],
-                    # No tick-side "confidence"/"exp_win_rate" exists for a
-                    # standalone LSTM pick -- map edge (0..0.5) onto the
-                    # same rough 0..1 scale those normally occupy, since
-                    # both feed PortfolioAllocator's stake sizing and the
-                    # candidate sort order below.
-                    "confidence": min(1.0, lstm_standalone["edge"] * 2.0),
-                    "exp_win_rate": lstm_standalone["p"],
-                    "rating": lstm_standalone["edge"],
-                    "duration": lstm_standalone["duration"],
-                    "exec_duration": lstm_standalone["duration"],
-                    "duration_unit": lstm_standalone["duration_unit"],
+                feats_m = compute_features(mv, m_models, minute_returns_window_dict)
+                if feats_m is None:
+                    return None
+                feats_m["recent_call_ratio"] = recent_call_ratio
+
+                p_up_m, confidence_m = fuse_signal(feats_m, state, s)
+                direction_m = 1 if p_up_m > 0.5 else -1
+                minute_returns = mv.returns()
+
+                mc_duration_m, exp_win_rate_m = monte_carlo_duration(
+                    mv.prices(), minute_returns, direction_m, feats_m,
+                    CANDIDATE_DURATIONS_MINUTES, models=m_models
+                )
+                if exp_win_rate_m < MIN_EXP_WIN_RATE:
+                    return None
+
+                # Gate 1: Layer agreement
+                gate_ok, n_agree, n_disagree, n_neutral = passes_layer_gate(feats_m, direction_m)
+                if not gate_ok:
+                    print(f"[Gate/Minute] {s} skipped — layer vote {n_agree} agree / "
+                          f"{n_disagree} disagree / {n_neutral} neutral "
+                          f"(need >={MIN_LAYER_AGREE} agree, <={MAX_LAYER_DISAGREE} disagree)")
+                    return None
+
+                # Gate 2: Permutation entropy
+                pe_ok, pe_score = entropy_gate_passes(mv.prices())
+                if not pe_ok:
+                    print(f"[EntropyGate/Minute] {s} skipped — PE={pe_score:.3f} >= {PE_THRESHOLD}")
+                    return None
+
+                # Gate 3: Multi-timeframe confluence
+                tf_agree, tf_dirs = multi_timeframe_confluence(mv.prices(), direction_m)
+                if tf_agree < MIN_TF_AGREEMENT:
+                    print(f"[Confluence/Minute] {s} skipped — only {tf_agree}/3 TFs agree {tf_dirs}")
+                    return None
+
+                # Gate 4: Bootstrap meta-ensemble agreement
+                bs_agrees, bs_p = meta_ensemble_agrees(minute_returns, direction_m,
+                                                       mc_duration_m, exp_win_rate_m)
+                if not bs_agrees:
+                    print(f"[MetaEnsemble/Minute] {s} skipped — bootstrap p={bs_p:.3f} vs "
+                          f"parametric p={exp_win_rate_m:.3f} disagree by >{BOOTSTRAP_AGREE_TOL}")
+                    return None
+
+                # Gate 5: advanced HMM/GBM Monte Carlo, minute-scale
+                mc_scan_m = hmm_gbm_scan(mv.prices(), minute_returns, CANDIDATE_DURATIONS_MINUTES,
+                                         hmm_model=getattr(m_models, "hmm_model", None))
+                sym_score_m = confidence_m * state.reliability.get(s, 1.0)
+                sym_thr_m   = state.per_symbol_threshold.get(s, state.adaptive_threshold)
+                sym_borderline_m = sym_score_m < MC_BORDERLINE_MULTIPLIER * sym_thr_m
+                if mc_scan_m["direction"] != direction_m:
+                    if sym_borderline_m:
+                        print(f"[MC/Minute] {s} skipped — BORDERLINE signal "
+                              f"(score={sym_score_m:.3f} < {MC_BORDERLINE_MULTIPLIER}x "
+                              f"threshold={sym_thr_m:.3f}) and advanced MC disagrees -- "
+                              f"leans {'CALL' if mc_scan_m['direction']>0 else 'PUT'} "
+                              f"(p={mc_scan_m['p']:.3f}) vs minute layer stack's "
+                              f"{'CALL' if direction_m>0 else 'PUT'}")
+                        return None
+                    print(f"[MC/Minute] {s}: advanced MC leans "
+                          f"{'CALL' if mc_scan_m['direction']>0 else 'PUT'} "
+                          f"(p={mc_scan_m['p']:.3f}, signal is strong -- "
+                          f"score={sym_score_m:.3f} >= {MC_BORDERLINE_MULTIPLIER}x threshold, "
+                          f"so this is diagnostic only) vs minute layer stack's "
+                          f"{'CALL' if direction_m>0 else 'PUT'} -- proceeding on the minute "
+                          f"layer stack's pick regardless.")
+
+                # Gate 6: RISEFALL LSTM ensemble hard veto -- same policy as
+                # the tick pipeline's Gate 6. Uses the ORIGINAL tick-based
+                # `sd` since lstm_evaluate() already looks at both tick and
+                # minute windows internally and prioritizes minute (see
+                # lstm_duration_scan()) -- it doesn't need a MinuteBarView.
+                lstm_best_m = lstm_evaluate(sd)
+                if lstm_best_m is not None and lstm_best_m["direction"] != direction_m:
+                    print(f"[LSTM/Minute] {s} skipped -- ensemble leans "
+                          f"{'CALL' if lstm_best_m['direction']>0 else 'PUT'} "
+                          f"(p={lstm_best_m['p']:.3f} p_std={lstm_best_m['p_std']:.3f}) vs minute "
+                          f"layer stack's {'CALL' if direction_m>0 else 'PUT'} -- Gate 6 is a "
+                          f"hard veto.")
+                    return None
+
+                return {
+                    "source": "minute_gates",
+                    "direction": direction_m,
+                    "p_up": float(p_up_m),
+                    "confidence": float(confidence_m),
+                    "exp_win_rate": float(exp_win_rate_m),
+                    "rating": abs(float(p_up_m) - 0.5),
+                    "duration": mc_duration_m,
+                    "exec_duration": mc_duration_m,
+                    "duration_unit": "m",
                 }
 
-            # v8: MINUTE TAKES PRIORITY OVER TICK -- not a pure "whichever
-            # is rated highest" comparison. Among whichever candidates
-            # qualified this cycle, prefer any with duration_unit=="m"
-            # over any with "t", regardless of relative edge; only among
-            # candidates that tie on duration_unit does rating (edge)
-            # break the tie. This mirrors lstm_duration_scan()'s own
-            # minute-over-tick policy (risefall_lstm_model.py) at this
-            # higher level too, since tick_candidate can ALSO carry a
-            # duration_unit=="m" (Gate 6's minute override inside
-            # try_tick_candidate) and needs to be weighed the same way
-            # against an lstm_standalone minute pick.
-            available = [c for c in (tick_candidate, lstm_candidate) if c is not None]
-            if not available:
-                continue
-            minute_available = [c for c in available if c["duration_unit"] == "m"]
-            pool = minute_available if minute_available else available
-            chosen = max(pool, key=lambda c: c["rating"])
+            # v9: MINUTE-FIRST ARCHITECTURE. try_minute_gates_candidate()
+            # (the full Gates 1-6 + MC pipeline running on minute bars) is
+            # tried FIRST, before anything else -- if it qualifies on its
+            # own, that trade fires directly and NEITHER the LSTM-
+            # standalone check NOR the tick-gate pipeline even run this
+            # cycle for this symbol. This is now the actual primary path,
+            # not a priority tiebreak layered on top of a tick-first
+            # design.
+            minute_gates_candidate = try_minute_gates_candidate()
 
-            if len(available) > 1:
-                print(f"[Signal] {s}: candidates this cycle -- " +
-                     ", ".join(f"{c['source']}({c['duration_unit']}, rating={c['rating']:.3f})"
-                              for c in available) +
-                     f" -- trading {chosen['source']} "
-                     f"({'minute-priority' if minute_available else 'no minute candidate, tick fallback'}).")
-            elif chosen["source"] == "lstm_standalone":
-                print(f"[LSTM] {s}: tick-gate pipeline did not qualify this cycle, but the "
-                      f"LSTM ensemble independently likes "
-                      f"{'CALL' if chosen['direction']>0 else 'PUT'} "
-                      f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading on that.")
+            if minute_gates_candidate is not None:
+                chosen = minute_gates_candidate
+                tick_candidate = None
+                print(f"[Minute] {s}: minute-native Gates 1-6 + MC pipeline qualifies on its "
+                      f"own (p={chosen['p_up']:.3f} rating={chosen['rating']:.3f}) -- trading "
+                      f"it directly, LSTM-standalone check and tick-gate pipeline both "
+                      f"skipped this cycle.")
+            else:
+                # No confident minute-native Gates+MC read this cycle --
+                # fall back to the LSTM ensemble's own opinion (still
+                # minute-preferring internally), then the tick-gate
+                # pipeline. Unchanged from the v8 logic.
+                lstm_standalone = lstm_evaluate(sd)
+                lstm_candidate = None
+                if lstm_standalone is not None and lstm_standalone["edge"] >= LSTM_MIN_EDGE_STANDALONE:
+                    lstm_candidate = {
+                        "source": "lstm_standalone",
+                        "direction": lstm_standalone["direction"],
+                        "p_up": lstm_standalone["p"],
+                        # No tick-side "confidence"/"exp_win_rate" exists for a
+                        # standalone LSTM pick -- map edge (0..0.5) onto the
+                        # same rough 0..1 scale those normally occupy, since
+                        # both feed PortfolioAllocator's stake sizing and the
+                        # candidate sort order below.
+                        "confidence": min(1.0, lstm_standalone["edge"] * 2.0),
+                        "exp_win_rate": lstm_standalone["p"],
+                        "rating": lstm_standalone["edge"],
+                        "duration": lstm_standalone["duration"],
+                        "exec_duration": lstm_standalone["duration"],
+                        "duration_unit": lstm_standalone["duration_unit"],
+                    }
+
+                if lstm_candidate is not None and lstm_candidate["duration_unit"] == "m":
+                    # Minute already won outright -- tick-gate pipeline skipped.
+                    chosen = lstm_candidate
+                    tick_candidate = None
+                    print(f"[LSTM] {s}: minute-priority pick clears the bar on its own "
+                          f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading it "
+                          f"directly, tick-gate pipeline skipped this cycle.")
+                else:
+                    # No confident MINUTE opinion anywhere this cycle -- fall
+                    # back to the full tick-gate pipeline. A tick-duration
+                    # lstm_standalone pick (if any) still competes against
+                    # the tick-gate result below by rating.
+                    tick_candidate = try_tick_candidate()
+                    available = [c for c in (tick_candidate, lstm_candidate) if c is not None]
+                    if not available:
+                        continue
+                    minute_available = [c for c in available if c["duration_unit"] == "m"]
+                    pool = minute_available if minute_available else available
+                    chosen = max(pool, key=lambda c: c["rating"])
+
+                    if len(available) > 1:
+                        print(f"[Signal] {s}: candidates this cycle -- " +
+                             ", ".join(f"{c['source']}({c['duration_unit']}, rating={c['rating']:.3f})"
+                                      for c in available) +
+                             f" -- trading {chosen['source']} "
+                             f"({'minute-priority' if minute_available else 'no minute candidate, tick fallback'}).")
+                    elif chosen["source"] == "lstm_standalone":
+                        print(f"[LSTM] {s}: tick-gate pipeline did not qualify this cycle, but the "
+                              f"LSTM ensemble independently likes "
+                              f"{'CALL' if chosen['direction']>0 else 'PUT'} "
+                              f"(p={chosen['p_up']:.3f} edge={chosen['rating']:.3f}) -- trading on that.")
 
             direction = chosen["direction"]
             duration = chosen["duration"]
@@ -5197,22 +5646,36 @@ async def main():
             if feats is None:
                 continue
 
-            # v8: ATOMIC final recheck, immediately before firing --
+            # v8/v9: ATOMIC final recheck, immediately before firing --
             # guards against the gate state having moved between the scan
-            # above and this execution loop. Which recheck applies
-            # depends on which pipeline actually originated this trade:
-            # Gates 1-5 never ran for an lstm_standalone candidate, so
-            # re-checking Gate 1 on it here would be re-checking a signal
-            # that was never part of the decision in the first place.
-            # execute_single_step()'s own atomic feats-based recheck below
-            # only applies to tick_gates candidates (feats=None skips it
-            # for lstm_standalone ones).
+            # above and this execution loop. Which recheck applies depends
+            # on which pipeline actually originated this trade: Gates 1-5
+            # never ran (on this data) for an lstm_standalone or
+            # minute_gates candidate, so re-checking the TICK-based Gate 1
+            # here would be re-checking a signal that was never part of the
+            # decision. execute_single_step()'s own atomic feats-based
+            # recheck below only applies to tick_gates candidates
+            # (feats=None skips it for the other two).
             if source == "lstm_standalone":
                 recheck = lstm_evaluate(sd)
                 if (recheck is None or recheck["direction"] != direction
                         or recheck["edge"] < LSTM_MIN_EDGE_STANDALONE):
                     print(f"[LSTM/Atomic] {symbol} blocked at execution -- ensemble's "
                           f"read moved between scan and fire.")
+                    continue
+                atomic_feats = None
+            elif source == "minute_gates":
+                mv_atomic = MinuteBarView(sd)
+                m_models_atomic = state.minute_model_cache.get(symbol)
+                feats_minute_atomic = (
+                    compute_features(mv_atomic, m_models_atomic, minute_returns_window_dict)
+                    if m_models_atomic is not None and mv_atomic.has_data(60) else None)
+                gate_ok_m = (passes_layer_gate(feats_minute_atomic, direction)[0]
+                            if feats_minute_atomic is not None else False)
+                if not gate_ok_m:
+                    print(f"[Minute/Atomic] {symbol} blocked at execution -- minute-native "
+                          f"read moved between scan and fire (data/model no longer available, "
+                          f"or Gate 1 no longer agrees).")
                     continue
                 atomic_feats = None
             else:
@@ -5223,7 +5686,20 @@ async def main():
             conf_sym  = next((c[3] for c in portfolio_candidates if c[0] == symbol), 0.0)
             score_sym = conf_sym * state.reliability.get(symbol, 1.0)
 
-            reset_sequence_accumulator(state, state.balance, p_up_sym, conf_sym, duration)
+            # v7: if Gate 6 (or an lstm_standalone pick) flagged a confident
+            # minute-bar trade for this symbol, trade the minute duration
+            # with the tick MC pick kept as a same-cycle fallback (see
+            # execute_single_step docstring). Computed here (not right
+            # before the buy call) so reset_sequence_accumulator below can
+            # record the REAL duration_unit for accurate trade-summary
+            # reporting -- log_trade_summary() used to hardcode "ticks"
+            # regardless of what actually got traded.
+            minute_override = lstm_minute_overrides.get(symbol)
+            exec_duration = minute_override if minute_override is not None else duration
+            exec_unit     = "m" if minute_override is not None else "t"
+
+            reset_sequence_accumulator(state, state.balance, p_up_sym, conf_sym, duration,
+                                       duration_unit=exec_unit)
 
             explain_signal(
                 symbol=symbol, direction=direction,
@@ -5239,13 +5715,6 @@ async def main():
                 "stake":     base_stake,
                 "open_time": time.time(),
             }
-
-            # v7: if Gate 6 flagged a confident minute-bar override for this
-            # symbol, trade the minute duration with the tick MC pick kept
-            # as a same-cycle fallback (see execute_single_step docstring).
-            minute_override = lstm_minute_overrides.get(symbol)
-            exec_duration = minute_override if minute_override is not None else duration
-            exec_unit     = "m" if minute_override is not None else "t"
 
             won, _ = await execute_single_step(
                 client, state, symbol, direction, base_stake, 0,
